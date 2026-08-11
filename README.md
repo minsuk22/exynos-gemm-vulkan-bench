@@ -24,6 +24,20 @@ Because the FMA order is identical everywhere, all four kernels should produce
 
 ---
 
+## Download
+
+A prebuilt arm64-v8a binary is attached to the
+[latest release](https://github.com/minsuk22/exynos-gemm-vulkan-bench/releases/latest)
+if you don't want to set up the NDK:
+
+```sh
+curl -L -o gemm_vk_bench \
+  https://github.com/minsuk22/exynos-gemm-vulkan-bench/releases/latest/download/gemm_vk_bench-android-arm64-v8a
+adb push gemm_vk_bench /data/local/tmp/
+adb shell chmod 755 /data/local/tmp/gemm_vk_bench
+adb shell /data/local/tmp/gemm_vk_bench --mode check --sizes 2048 --iters 2
+```
+
 ## Build
 
 Requires the Android NDK, CMake + Ninja, and `glslangValidator`. Defaults point
