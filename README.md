@@ -16,8 +16,25 @@ compile time with `-DUSE_SHARED_A` / `-DUSE_SHARED_B`. Tiling, register
 blocking, loop order and FMA order are identical, so the delta you measure is
 the operand-staging strategy and nothing else.
 
-**Tiling:** workgroup 16×16 invocations, 64×64 output tile per workgroup, 4×4
-outputs per invocation, K-tile depth 16.
+**Tiling:** workgroup is fixed at 16×16 invocations with a K-tile depth of 16.
+The micro-tile each invocation computes is a build-time parameter: `TM`×`TN`
+for `TM,TN ∈ {4,6,8}`, giving a block tile of `16·TM` × `16·TN`. All nine pairs
+are built for all four staging variants — 36 kernels embedded — so `--sweep`
+compares tiling and staging independently.
+
+Larger micro-tiles raise arithmetic intensity: per k-step a kernel issues
+`TM+TN` operand loads against `TM·TN` FMAs, so 4×4 does 2 FMA per load while
+8×8 does 4. The cost is register pressure (`acc[8][8]` is 64 accumulators) and
+lower occupancy, which is the tradeoff the sweep measures.
+
+**Partial tiles.** A block tile need not divide the matrix — `TM=6` gives a
+block of 96, and 96 never divides a power-of-two size. The dispatch grid is
+rounded up and only the store to `C` is guarded; the loads are allowed to run
+into buffer slack that is allocated and zeroed for the purpose. The guard sits
+outside the k loop (one predicate per output element against `K·TM·TN` FMAs)
+and is identical in all four variants, so it does not distort the comparison.
+FLOP counts stay at the logical `2·M·N·K`, which charges a non-dividing tile
+for the work it wastes on the padded edge rather than crediting it.
 
 Because the FMA order is identical everywhere, all four kernels should produce
 **bit-identical** results — the benchmark checks that too.
@@ -93,9 +110,13 @@ the C++ runtime is statically linked, so it only needs the platform's
 ## Run
 
 ```powershell
-.\run_on_device.ps1 -Mode perf      # timing only  (default)
+.\run_on_device.ps1 -Mode perf      # timing only  (default), tile 4x4
 .\run_on_device.ps1 -Mode check     # timing + result verification
+.\run_on_device.ps1 -Sweep          # all 9 tiles x 4 variants, ranked
 ```
+
+The sweep runs 36 kernels per size. At roughly 20 ms (2048) and 150 ms (4096)
+per iteration with the default 5+2 runs, expect on the order of a minute.
 
 The script pushes the binary to `/data/local/tmp/gemm_bench`, runs it, and
 saves the console log plus a CSV under `results\`.
@@ -130,6 +151,8 @@ adb shell /data/local/tmp/gemm_vk_bench --mode perf
 --iters <n>           timed iterations per kernel (default 5)
 --warmup <n>          untimed warmup iterations (default 2)
 --kernels <list>      subset of none,shared_a,shared_b,shared_ab
+--tile <TMxTN>        micro-tile per invocation, default 4x4. Repeatable.
+--sweep               run every built (TM,TN) pair and rank the results
 --samples <n>         check mode: elements verified against CPU (default 4096)
 --full-check          check mode: verify the whole matrix on CPU (slow)
 --device <idx>        physical device index
@@ -139,8 +162,8 @@ adb shell /data/local/tmp/gemm_vk_bench --mode perf
 --csv <path>          append per-run results to a CSV
 ```
 
-Sizes must be multiples of 64 (M/N tile) and 16 (K tile). 2048 and 4096 both
-qualify.
+Sizes must be multiples of 16 (the K tile). M and N need not divide the block
+tile — see "Partial tiles" above.
 
 ## Output
 
@@ -149,16 +172,20 @@ best / median / mean, TFLOPS at best and mean, and speedup relative to the
 first kernel in the list.
 
 ```
-[shared_ab]  A:shared  B:shared
+[shared_ab 8x8]  A:shared  B:shared  block 128x128  grid 16x16
     run 1/5   gpu   XXX.XXX ms   wall   XXX.XXX ms    X.XXXX TFLOPS
     ...
 
- kernel     A / B             best_ms    med_ms    avg_ms TFLOPS_bst TFLOPS_avg  vs base
- none       global / global   ...
- shared_a   shared / global   ...
- shared_b   global / shared   ...
- shared_ab  shared / shared   ...
+ rank kernel      tile block     A / B              best_ms    med_ms TFLOPS_bst   TF_wall  vs best
+    1 shared_ab    8x8 128x128   shared / shared    ...
+    2 ...
+
+ BEST at 2048: shared_ab  tile 8x8 (block 128x128, A:shared B:shared)  ... TFLOPS
 ```
+
+Rows are ranked by best time, so the winner is the first line and the `BEST`
+line names it explicitly. Ranking is per size — the best tile at 2048 need not
+be the best at 4096.
 
 FLOP count is the standard `2*M*N*K`: 17.180 GFLOP at 2048, 137.439 GFLOP at
 4096. Note that GFLOP divided by milliseconds is already TFLOP/s

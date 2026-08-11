@@ -132,7 +132,17 @@ void main()
         }
     }
 
-    [[unroll]] for (uint i = 0; i < TM; ++i)
-        [[unroll]] for (uint j = 0; j < TN; ++j)
-            C[(gRow + i) * p.N + gCol + j] = acc[i][j];
+    // The dispatch grid is rounded up, because a block tile need not divide the
+    // matrix -- TM=6 gives BM=96, which never divides a power-of-two size. The
+    // loads above are allowed to run past M/N into the buffers' allocated slack
+    // (harmless: those results are discarded), so only the store is guarded.
+    // This sits outside the k loop, one predicate per output element against
+    // K*TM*TN fused multiply-adds, and is identical in all four variants.
+    [[unroll]] for (uint i = 0; i < TM; ++i) {
+        if (gRow + i >= p.M) continue;
+        [[unroll]] for (uint j = 0; j < TN; ++j) {
+            if (gCol + j < p.N)
+                C[(gRow + i) * p.N + gCol + j] = acc[i][j];
+        }
+    }
 }

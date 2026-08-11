@@ -12,6 +12,7 @@ param(
     [string]$Sizes     = "2048,4096",
     [int]$Iters        = 5,
     [int]$Warmup       = 2,
+    [switch]$Sweep,        # run every built (TM,TN) tile and rank them
     [string]$ExtraArgs = "",
     [string]$Serial    = "",
     [string]$AdbExe    = "D:\Android\sdk\platform-tools\adb.exe",
@@ -50,7 +51,8 @@ $logPath   = Join-Path $resultDir "$stamp-$Mode.log"
 $csvLocal  = Join-Path $resultDir "$stamp-$Mode.csv"
 $csvRemote = "$RemoteDir/results.csv"
 
-$cmd = "cd $RemoteDir && ./$remoteBin --mode $Mode --sizes $Sizes --iters $Iters --warmup $Warmup --csv $csvRemote $ExtraArgs"
+$sweepArg = if ($Sweep) { "--sweep" } else { "" }
+$cmd = "cd $RemoteDir && ./$remoteBin --mode $Mode --sizes $Sizes --iters $Iters --warmup $Warmup $sweepArg --csv $csvRemote $ExtraArgs"
 Write-Host "==> $cmd" -ForegroundColor Cyan
 Write-Host ""
 
