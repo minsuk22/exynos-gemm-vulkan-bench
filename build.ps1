@@ -48,10 +48,18 @@ Write-Host "==> building" -ForegroundColor Cyan
 & $CMakeExe --build $buildDir --parallel
 if ($LASTEXITCODE -ne 0) { throw "cmake build failed" }
 
-$bin = Join-Path $buildDir "gemm_vk_bench"
-Copy-Item $bin (Join-Path $outDir "gemm_vk_bench") -Force
+# Name carries the version (set via OUTPUT_NAME in CMakeLists.txt). Note the
+# version suffix makes PowerShell see ".2" as an extension, so match on name.
+$bin = Get-ChildItem $buildDir -Filter "gemm_vk_bench-v*" -File |
+       Where-Object { $_.Name -notmatch '\.(pdb|ilk|map|cmake|txt)$' } |
+       Sort-Object Length -Descending | Select-Object -First 1
+if (-not $bin) { throw "built binary not found in $buildDir" }
 
-$size = (Get-Item $bin).Length
+$name    = "$($bin.Name)-android-$Abi"
+$outFile = Join-Path $outDir $name
+Copy-Item $bin.FullName $outFile -Force
+
 Write-Host ""
-Write-Host "==> OK  $outDir\gemm_vk_bench  ($([math]::Round($size/1KB,1)) KB)" -ForegroundColor Green
+Write-Host "==> OK  $outFile  ($([math]::Round($bin.Length/1KB,1)) KB)" -ForegroundColor Green
+Write-Host "    sha256 $((Get-FileHash $outFile -Algorithm SHA256).Hash.ToLower())"
 Write-Host "    push and run:  .\run_on_device.ps1 -Mode perf"

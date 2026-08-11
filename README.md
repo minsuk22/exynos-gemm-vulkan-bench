@@ -71,6 +71,20 @@ If you change the build, verify with
 `spirv-dis foo.spv | grep -c Fma` — anything other than 256 for the default
 tiling means the unroll did not happen.
 
+### Checking which binary you are running
+
+The binary name carries its version, and the report header repeats it along
+with a scan of the embedded SPIR-V:
+
+```
+ version v0.1.2   built Aug 11 2026 13:24:07
+  Embedded SPIR-V   : none=19968B/256FMA, shared_a=19196B/256FMA, ...
+```
+
+`256FMA` per kernel means the shader is optimized. Anything else (in
+particular `1FMA`) prints a loud warning and means the numbers are a build
+artifact, not a GPU result. `--version` prints the same summary and exits.
+
 Output: `out\gemm_vk_bench` — a single self-contained arm64-v8a PIE. The SPIR-V
 for all four kernels is embedded in the binary (no shader files to push), and
 the C++ runtime is statically linked, so it only needs the platform's

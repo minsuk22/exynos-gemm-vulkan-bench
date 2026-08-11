@@ -20,10 +20,17 @@ param(
 
 $ErrorActionPreference = "Stop"
 $root = $PSScriptRoot
-$bin  = Join-Path $root "out\gemm_vk_bench"
 
 if (-not (Test-Path $AdbExe)) { throw "adb not found: $AdbExe" }
-if (-not (Test-Path $bin))    { throw "binary not found: $bin  (run .\build.ps1 first)" }
+
+# Pick the newest versioned build from out\ and push it under its own name, so
+# the device never holds an ambiguous "gemm_vk_bench" of unknown vintage.
+$bin = Get-ChildItem (Join-Path $root "out") -Filter "gemm_vk_bench-v*" -File -ErrorAction SilentlyContinue |
+       Sort-Object LastWriteTime -Descending | Select-Object -First 1
+if (-not $bin) { throw "no binary in $root\out  (run .\build.ps1 first)" }
+$remoteBin = $bin.Name
+Write-Host "==> binary: $($bin.Name)" -ForegroundColor Cyan
+Write-Host "    sha256  $((Get-FileHash $bin.FullName -Algorithm SHA256).Hash.ToLower())"
 
 $adbArgs = @()
 if ($Serial) { $adbArgs += @("-s", $Serial) }
@@ -33,8 +40,8 @@ if (-not $devices) { throw "no Android device in 'device' state. Check 'adb devi
 Write-Host "==> device: $($devices[0])" -ForegroundColor Cyan
 
 & $AdbExe @adbArgs shell mkdir -p $RemoteDir | Out-Null
-& $AdbExe @adbArgs push $bin "$RemoteDir/gemm_vk_bench" | Out-Null
-& $AdbExe @adbArgs shell chmod 755 "$RemoteDir/gemm_vk_bench" | Out-Null
+& $AdbExe @adbArgs push $bin.FullName "$RemoteDir/$remoteBin" | Out-Null
+& $AdbExe @adbArgs shell chmod 755 "$RemoteDir/$remoteBin" | Out-Null
 
 $stamp     = Get-Date -Format "yyyyMMdd-HHmmss"
 $resultDir = Join-Path $root "results"
@@ -43,7 +50,7 @@ $logPath   = Join-Path $resultDir "$stamp-$Mode.log"
 $csvLocal  = Join-Path $resultDir "$stamp-$Mode.csv"
 $csvRemote = "$RemoteDir/results.csv"
 
-$cmd = "cd $RemoteDir && ./gemm_vk_bench --mode $Mode --sizes $Sizes --iters $Iters --warmup $Warmup --csv $csvRemote $ExtraArgs"
+$cmd = "cd $RemoteDir && ./$remoteBin --mode $Mode --sizes $Sizes --iters $Iters --warmup $Warmup --csv $csvRemote $ExtraArgs"
 Write-Host "==> $cmd" -ForegroundColor Cyan
 Write-Host ""
 

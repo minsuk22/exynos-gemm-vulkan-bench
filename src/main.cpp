@@ -127,6 +127,38 @@ static const KernelDesc kKernels[] = {
 };
 static const int kNumKernels = (int)(sizeof(kKernels) / sizeof(kKernels[0]));
 
+#ifndef GEMM_BENCH_VERSION
+#define GEMM_BENCH_VERSION "dev"
+#endif
+
+// Expected OpFma count for the default tiling: BK(16) * TM(4) * TN(4).
+static const uint32_t kExpectedFma = 256;
+
+// Walk the embedded SPIR-V and count GLSL.std.450 Fma instructions.
+//
+// This is the build's own smoke test. Without shader optimization the inner
+// loop stays rolled and the accumulators live in scratch memory, which costs
+// ~1000x; the giveaway is that the whole module contains a single Fma instead
+// of 256. Printing this at startup makes a stale or mis-built binary obvious
+// from the log alone, instead of looking like a hardware result.
+static uint32_t countFma(const uint32_t* spv, size_t bytes)
+{
+    const size_t n = bytes / sizeof(uint32_t);
+    if (n < 5 || spv[0] != 0x07230203u) return UINT32_MAX;   // not SPIR-V
+
+    uint32_t count = 0;
+    for (size_t i = 5; i < n; ) {
+        const uint32_t wordCount = spv[i] >> 16;
+        const uint32_t opcode    = spv[i] & 0xFFFFu;
+        if (wordCount == 0 || i + wordCount > n) break;       // malformed
+        // OpExtInst: [0]=hdr [1]=type [2]=result [3]=set [4]=instruction literal
+        if (opcode == 12u && wordCount >= 5 && spv[i + 4] == 50u /* Fma */)
+            ++count;
+        i += wordCount;
+    }
+    return count;
+}
+
 // ---------------------------------------------------------------------------
 // options
 // ---------------------------------------------------------------------------
@@ -203,6 +235,14 @@ static Options parseArgs(int argc, char** argv)
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "-h" || a == "--help") { usage(argv[0]); exit(0); }
+        else if (a == "--version" || a == "-V") {
+            printf("gemm_vk_bench %s (built %s %s)\n", GEMM_BENCH_VERSION, __DATE__, __TIME__);
+            for (int k = 0; k < kNumKernels; ++k)
+                printf("  %-10s %6u bytes SPIR-V, %u Fma (expected %u)\n", kKernels[k].name,
+                       (unsigned)kKernels[k].spvBytes,
+                       countFma(kKernels[k].spv, kKernels[k].spvBytes), kExpectedFma);
+            exit(0);
+        }
         else if (a == "--mode") {
             std::string m = need(i, "--mode"); ++i;
             if (m == "perf")       o.check = false;
@@ -629,6 +669,7 @@ int main(int argc, char** argv)
 
     printf("======================================================================\n");
     printf(" Vulkan GEMM benchmark  (fp32, C[MxN] = A[MxK] * B[KxN], row-major)\n");
+    printf(" version %s   built %s %s\n", GEMM_BENCH_VERSION, __DATE__, __TIME__);
     printf("======================================================================\n");
     printf("  Device            : %s\n", ctx.props.deviceName);
     printf("  Type              : %s\n", devTypeStr(ctx.props.deviceType));
@@ -650,6 +691,26 @@ int main(int argc, char** argv)
                    : "PERF (results are not verified)");
     printf("  Iterations        : %d timed + %d warmup\n", o.iters, o.warmup);
     printf("  Seed              : %u\n", o.seed);
+
+    // Embedded shader self-check (see countFma).
+    printf("  Embedded SPIR-V   :");
+    bool shaderOk = true;
+    for (int k = 0; k < kNumKernels; ++k) {
+        uint32_t fma = countFma(kKernels[k].spv, kKernels[k].spvBytes);
+        if (fma != kExpectedFma) shaderOk = false;
+        printf("%s %s=%uB/%uFMA", k ? "," : "", kKernels[k].name,
+               (unsigned)kKernels[k].spvBytes, fma);
+    }
+    printf("\n");
+    if (!shaderOk) {
+        printf("\n");
+        printf("  *********************************************************************\n");
+        printf("  ** WARNING: shaders are NOT optimized (expected %u Fma per kernel). **\n", kExpectedFma);
+        printf("  ** The inner loop is still rolled and the accumulators spill to     **\n");
+        printf("  ** scratch memory. Results will be ~1000x too slow and are NOT a    **\n");
+        printf("  ** property of the GPU. Rebuild with glslc -O.                      **\n");
+        printf("  *********************************************************************\n");
+    }
     printf("\n");
 
     {   // sanity: the shared_ab variant needs the most LDS
@@ -934,8 +995,9 @@ int main(int argc, char** argv)
         printf("---------------------------------------------------------------------------------------\n");
         printf(" summary  M=N=K=%u   (%.3f GFLOP per GEMM, %d runs)\n", S, gflop, o.iters);
         printf("---------------------------------------------------------------------------------------\n");
-        printf(" %-10s %-16s %9s %9s %9s %10s %10s %8s\n",
-               "kernel", "A / B", "best_ms", "med_ms", "avg_ms", "TFLOPS_bst", "TFLOPS_avg", "vs base");
+        printf(" %-10s %-16s %9s %9s %9s %10s %10s %9s %8s\n",
+               "kernel", "A / B", "best_ms", "med_ms", "avg_ms", "TFLOPS_bst", "TFLOPS_avg",
+               "TF_wall", "vs base");
         printf("---------------------------------------------------------------------------------------\n");
 
         double baseBest = 0.0;
@@ -950,11 +1012,16 @@ int main(int argc, char** argv)
             avg /= (double)t.size();
             if (i == 0) baseBest = best;
 
+            // Wall-clock TFLOPS is carried alongside so a bogus timestampPeriod
+            // or query result shows up as a mismatch instead of a GPU verdict.
+            double wallBest = *std::min_element(rs.wallMs.begin(), rs.wallMs.end());
+
             char ab[32];
             snprintf(ab, sizeof(ab), "%s / %s", kd.aSrc, kd.bSrc);
-            printf(" %-10s %-16s %9.3f %9.3f %9.3f %10.4f %10.4f %7.2fx\n",
+            printf(" %-10s %-16s %9.3f %9.3f %9.3f %10.4f %10.4f %9.4f %7.2fx\n",
                    kd.name, ab, best, med, avg,
-                   gflop / best / 1e3, gflop / avg / 1e3, baseBest / best);
+                   gflop / best / 1e3, gflop / avg / 1e3, gflop / wallBest / 1e3,
+                   baseBest / best);
         }
         printf("---------------------------------------------------------------------------------------\n");
         printf(" timing source: %s\n", haveTs ? "GPU timestamps" : "wall clock (submit->fence)");

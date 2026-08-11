@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(gemm_vk_bench CXX)
+project(gemm_vk_bench VERSION 0.1.2 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -65,6 +65,16 @@ add_executable(gemm_vk_bench src/main.cpp)
 add_dependencies(gemm_vk_bench gemm_shaders)
 target_include_directories(gemm_vk_bench PRIVATE ${GEN_DIR})
 target_compile_options(gemm_vk_bench PRIVATE -O3 -Wall)
+
+# The version is baked in and printed in the report header, so a log always
+# identifies the binary that produced it.
+target_compile_definitions(gemm_vk_bench PRIVATE
+  GEMM_BENCH_VERSION="v${PROJECT_VERSION}")
+
+# Carry the version in the file name too, so a stale push to the device is
+# visible before it is ever run.
+set_target_properties(gemm_vk_bench PROPERTIES
+  OUTPUT_NAME "gemm_vk_bench-v${PROJECT_VERSION}")
 
 if(ANDROID)
   # libvulkan.so is part of the platform from API 24 on; the NDK ships the stub.
