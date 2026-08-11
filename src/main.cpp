@@ -119,6 +119,7 @@ struct KernelDesc {
     const char*     aLayout;   // "col" (A uploaded transposed) or "row"
     uint32_t        tm;        // rows of C per invocation
     uint32_t        tn;        // cols of C per invocation
+    uint32_t        db;        // 1 = LDS tiles are ping-ponged
     const uint32_t* spv;
     size_t          spvBytes;
 
@@ -127,11 +128,20 @@ struct KernelDesc {
     bool     aCol()   const { return aLayout[0] == 'c'; }
     // Fully unrolled inner loop is BK * TM * TN fused multiply-adds.
     uint32_t expectedFma() const { return kTileK * tm * tn; }
-    // LDS bytes: the row-major A staging store needs a pad, column-major does not.
+    // LDS bytes. The row-major A staging store needs a pad, column-major does
+    // not; double buffering holds two of every tile.
     uint32_t ldsBytes() const {
         uint32_t n = 0;
         if (aSrc[0] == 's') n += kTileK * (blockM() + (aCol() ? 0u : 4u)) * 4u;
         if (bSrc[0] == 's') n += kTileK * blockN() * 4u;
+        return n * (db ? 2u : 1u);
+    }
+    // Per-invocation prefetch registers held across the compute phase.
+    uint32_t prefetchRegs() const {
+        if (!db) return 0;
+        uint32_t n = 0;
+        if (aSrc[0] == 's') n += (kTileK * blockM()) / (kTS * kTS);
+        if (bSrc[0] == 's') n += (kTileK * blockN()) / (kTS * kTS);
         return n;
     }
 };
@@ -181,6 +191,7 @@ struct Options {
     std::vector<std::string> variants{ "none", "shared_a", "shared_b", "shared_ab" };
     std::vector<std::pair<uint32_t, uint32_t>> tiles;   // (TM,TN); filled in below
     std::vector<std::string> aLayouts;                  // "col" and/or "row"
+    std::vector<int>      dbModes;                      // 0 and/or 1
     std::vector<int>      kernels;                      // resolved indices into kKernels
     bool        sweep       = false;
     int         iters       = 5;
@@ -211,6 +222,8 @@ static void usage(const char* argv0)
 "  --tile <TMxTN>        micro-tile per invocation, default 4x4. Repeatable.\n"
 "  --a-layout <l>        storage order of A: col (default), row, or both.\n"
 "                        col uploads A transposed; B and C are always row-major\n"
+"  --double-buffer <d>   LDS tile ping-pong: both (default), on, or off.\n"
+"                        no effect on the 'none' variant, which uses no LDS\n"
 "  --sweep               run every built (TM,TN) pair and rank the results\n"
 "  --samples <n>         check mode: random output elements to verify (default 4096)\n"
 "  --full-check          check mode: verify every element with a CPU GEMM (slow)\n"
@@ -278,10 +291,11 @@ static Options parseArgs(int argc, char** argv)
                 uint32_t fma = countFma(kd.spv, kd.spvBytes);
                 bool ok = (fma == kd.expectedFma());
                 if (!ok) ++bad;
-                printf("  %-10s %ux%u A-%s  block %3ux%-3u  LDS %5uB  %6u B  "
-                       "%5u Fma (expect %5u) %s\n",
-                       kd.name, kd.tm, kd.tn, kd.aLayout, kd.blockM(), kd.blockN(),
-                       kd.ldsBytes(), (unsigned)kd.spvBytes, fma, kd.expectedFma(),
+                printf("  %-10s %ux%u A-%s %-6s block %3ux%-3u LDS %5uB pre %2u  "
+                       "%6u B  %5u Fma (expect %5u) %s\n",
+                       kd.name, kd.tm, kd.tn, kd.aLayout, kd.db ? "db" : "single",
+                       kd.blockM(), kd.blockN(), kd.ldsBytes(), kd.prefetchRegs(),
+                       (unsigned)kd.spvBytes, fma, kd.expectedFma(),
                        ok ? "ok" : "MISMATCH");
             }
             printf("%s\n", bad ? "*** some shaders are not optimized; rebuild with glslc -O ***"
@@ -326,6 +340,14 @@ static Options parseArgs(int argc, char** argv)
             else if (l == "both")              o.aLayouts = { "col", "row" };
             else die("--a-layout expects col, row or both (got '%s')", l.c_str());
         }
+        else if (a == "--double-buffer") {
+            std::string d = need(i, "--double-buffer"); ++i;
+            o.dbModes.clear();
+            if (d == "on")        o.dbModes = { 1 };
+            else if (d == "off")  o.dbModes = { 0 };
+            else if (d == "both") o.dbModes = { 0, 1 };
+            else die("--double-buffer expects on, off or both (got '%s')", d.c_str());
+        }
         else if (a == "--sweep")        { o.sweep = true; }
         else if (a == "--iters")        { o.iters = atoi(need(i, "--iters")); ++i; }
         else if (a == "--warmup")       { o.warmup = atoi(need(i, "--warmup")); ++i; }
@@ -362,21 +384,28 @@ static Options parseArgs(int argc, char** argv)
         }
     }
     if (o.aLayouts.empty()) o.aLayouts.push_back(kDefaultALayout);
+    if (o.dbModes.empty())  o.dbModes = { 0, 1 };
 
     // Layout is the outermost loop: switching it means re-uploading A, so this
     // ordering keeps that to one upload per layout per size.
     for (const std::string& lay : o.aLayouts) {
         for (auto& t : o.tiles) {
             for (const std::string& v : o.variants) {
-                int found = -1;
-                for (int k = 0; k < kNumKernels; ++k)
-                    if (v == kKernels[k].name && kKernels[k].aLayout == lay &&
-                        kKernels[k].tm == t.first && kKernels[k].tn == t.second)
-                        found = k;
-                if (found < 0)
-                    die("no kernel built for %s tile %ux%u A-%s (see --help)",
-                        v.c_str(), t.first, t.second, lay.c_str());
-                o.kernels.push_back(found);
+                for (int db : o.dbModes) {
+                    int found = -1;
+                    for (int k = 0; k < kNumKernels; ++k)
+                        if (v == kKernels[k].name && kKernels[k].aLayout == lay &&
+                            kKernels[k].tm == t.first && kKernels[k].tn == t.second &&
+                            (int)kKernels[k].db == db)
+                            found = k;
+                    // "none" has no LDS, so no db=1 build exists; that is not an
+                    // error, there is simply nothing to ping-pong.
+                    if (found < 0 && db == 1 && v == "none") continue;
+                    if (found < 0)
+                        die("no kernel built for %s tile %ux%u A-%s db=%d (see --help)",
+                            v.c_str(), t.first, t.second, lay.c_str(), db);
+                    o.kernels.push_back(found);
+                }
             }
         }
     }
@@ -785,6 +814,34 @@ int main(int argc, char** argv)
                    : "PERF (results are not verified)");
     printf("  Iterations        : %d timed + %d warmup\n", o.iters, o.warmup);
     printf("  Seed              : %u\n", o.seed);
+    printf("\n");
+
+    if (kTS * kTS > ctx.props.limits.maxComputeWorkGroupInvocations)
+        die("kernel uses %u invocations per workgroup, device allows %u",
+            kTS * kTS, ctx.props.limits.maxComputeWorkGroupInvocations);
+
+    // Drop kernels that do not fit in LDS rather than aborting: double
+    // buffering doubles the tile storage, so a sweep can legitimately contain
+    // a few combinations this device cannot run.
+    {
+        std::vector<int> fits;
+        for (int kidx : o.kernels) {
+            const KernelDesc& kd = kKernels[kidx];
+            if (kd.ldsBytes() <= ctx.props.limits.maxComputeSharedMemorySize) {
+                fits.push_back(kidx);
+            } else {
+                printf("  SKIP %s %ux%u A-%s%s: needs %u B of LDS, device allows %u\n",
+                       kd.name, kd.tm, kd.tn, kd.aLayout, kd.db ? " db" : "",
+                       kd.ldsBytes(), ctx.props.limits.maxComputeSharedMemorySize);
+            }
+        }
+        if (fits.empty())
+            die("every selected kernel exceeds the device shared memory limit (%u bytes)",
+                ctx.props.limits.maxComputeSharedMemorySize);
+        if (fits.size() != o.kernels.size())
+            printf("  (%u kernels skipped)\n\n", (unsigned)(o.kernels.size() - fits.size()));
+        o.kernels.swap(fits);
+    }
 
     // Embedded shader self-check over the kernels actually selected (countFma).
     printf("  Kernels selected  : %u of %d built\n", (unsigned)o.kernels.size(), kNumKernels);
@@ -808,18 +865,6 @@ int main(int argc, char** argv)
     }
     printf("\n");
 
-    {   // device limits, against the largest tile actually selected
-        if (kTS * kTS > ctx.props.limits.maxComputeWorkGroupInvocations)
-            die("kernel uses %u invocations per workgroup, device allows %u",
-                kTS * kTS, ctx.props.limits.maxComputeWorkGroupInvocations);
-        for (int kidx : o.kernels) {
-            const KernelDesc& kd = kKernels[kidx];
-            if (kd.ldsBytes() > ctx.props.limits.maxComputeSharedMemorySize)
-                die("%s tile %ux%u A-%s needs %u bytes of shared memory, device allows %u",
-                    kd.name, kd.tm, kd.tn, kd.aLayout, kd.ldsBytes(),
-                    ctx.props.limits.maxComputeSharedMemorySize);
-        }
-    }
 
     // ---- shared pipeline objects -----------------------------------------
     VkDescriptorSetLayoutBinding binds[3]{};
@@ -885,8 +930,9 @@ int main(int argc, char** argv)
     if (!o.csvPath.empty()) {
         csv = fopen(o.csvPath.c_str(), "w");
         if (!csv) die("cannot open CSV file '%s'", o.csvPath.c_str());
-        fprintf(csv, "device,size,kernel,a_source,b_source,a_layout,tm,tn,block_m,block_n,"
-                     "lds_bytes,run,gpu_ms,wall_ms,gflop,tflops\n");
+        fprintf(csv, "device,size,kernel,a_source,b_source,a_layout,double_buffer,"
+                     "tm,tn,block_m,block_n,lds_bytes,prefetch_regs,"
+                     "run,gpu_ms,wall_ms,gflop,tflops\n");
     }
 
     // ---- per size ---------------------------------------------------------
@@ -1080,9 +1126,11 @@ int main(int argc, char** argv)
                 }
             };
 
-            printf("[%-9s %ux%u A-%s]  A:%s  B:%s  block %ux%u  grid %ux%u  LDS %uB\n",
-                   kd.name, kd.tm, kd.tn, kd.aLayout, kd.aSrc, kd.bSrc,
-                   kd.blockM(), kd.blockN(), gx, gy, kd.ldsBytes());
+            printf("[%-9s %ux%u A-%s %-6s]  A:%s  B:%s  block %ux%u  grid %ux%u  "
+                   "LDS %uB  prefetch %u regs\n",
+                   kd.name, kd.tm, kd.tn, kd.aLayout, kd.db ? "db" : "single",
+                   kd.aSrc, kd.bSrc, kd.blockM(), kd.blockN(), gx, gy,
+                   kd.ldsBytes(), kd.prefetchRegs());
 
             for (int w2 = 0; w2 < o.warmup; ++w2) runOnce(nullptr, nullptr);
 
@@ -1101,9 +1149,10 @@ int main(int argc, char** argv)
                        it + 1, o.iters, gpuStr, wm, tflops(gflop, t));
                 fflush(stdout);
                 if (csv)
-                    fprintf(csv, "%s,%u,%s,%s,%s,%s,%u,%u,%u,%u,%u,%d,%.6f,%.6f,%.3f,%.6f\n",
+                    fprintf(csv, "%s,%u,%s,%s,%s,%s,%u,%u,%u,%u,%u,%u,%u,%d,%.6f,%.6f,%.3f,%.6f\n",
                             ctx.props.deviceName, S, kd.name, kd.aSrc, kd.bSrc, kd.aLayout,
-                            kd.tm, kd.tn, kd.blockM(), kd.blockN(), kd.ldsBytes(), it + 1,
+                            kd.db, kd.tm, kd.tn, kd.blockM(), kd.blockN(),
+                            kd.ldsBytes(), kd.prefetchRegs(), it + 1,
                             g, wm, gflop, tflops(gflop, t));
             }
 
@@ -1194,9 +1243,9 @@ int main(int argc, char** argv)
         printf(" summary  M=N=K=%u   (%.3f GFLOP per GEMM, %d runs, ranked by best time)\n",
                S, gflop, o.iters);
         printf("%s", kSep);
-        printf(" %4s %-10s %5s %-9s %-16s %6s %9s %9s %10s %9s %8s\n",
-               "rank", "kernel", "tile", "block", "A / B", "A-ord", "best_ms", "med_ms",
-               "TFLOPS_bst", "TF_wall", "vs best");
+        printf(" %4s %-10s %5s %-9s %-16s %6s %7s %9s %9s %10s %8s\n",
+               "rank", "kernel", "tile", "block", "A / B", "A-ord", "dbuf", "best_ms",
+               "med_ms", "TFLOPS_bst", "vs best");
         printf("%s", kSep);
 
         // Rank by best time. The FLOP count is the logical 2*M*N*K, so a tiling
@@ -1215,18 +1264,18 @@ int main(int argc, char** argv)
             snprintf(tile,  sizeof(tile),  "%ux%u", kd.tm, kd.tn);
             snprintf(block, sizeof(block), "%ux%u", kd.blockM(), kd.blockN());
             snprintf(ab,    sizeof(ab),    "%s / %s", kd.aSrc, kd.bSrc);
-            printf(" %4zu %-10s %5s %-9s %-16s %6s %9.3f %9.3f %10.4f %9.4f %7.2fx\n",
-                   r + 1, kd.name, tile, block, ab, kd.aLayout, row.best, row.med,
-                   tflops(gflop, row.best), tflops(gflop, row.wallBest),
-                   topBest / row.best);
+            printf(" %4zu %-10s %5s %-9s %-16s %6s %7s %9.3f %9.3f %10.4f %7.2fx\n",
+                   r + 1, kd.name, tile, block, ab, kd.aLayout,
+                   kd.db ? "on" : "off", row.best, row.med,
+                   tflops(gflop, row.best), topBest / row.best);
         }
         printf("%s", kSep);
         if (!rows.empty()) {
             const Row& w = rows[order[0]];
-            printf(" BEST at %u: %s  tile %ux%u  A %s-major  (block %ux%u, A:%s B:%s)"
-                   "  %.3f ms  %.4f TFLOPS\n",
+            printf(" BEST at %u: %s  tile %ux%u  A %s-major  double-buffer %s"
+                   "  (block %ux%u, A:%s B:%s)  %.3f ms  %.4f TFLOPS\n",
                    S, w.kd->name, w.kd->tm, w.kd->tn, w.kd->aLayout,
-                   w.kd->blockM(), w.kd->blockN(),
+                   w.kd->db ? "on" : "off", w.kd->blockM(), w.kd->blockN(),
                    w.kd->aSrc, w.kd->bSrc, w.best, tflops(gflop, w.best));
         }
         printf(" timing source: %s\n", haveTs ? "GPU timestamps" : "wall clock (submit->fence)");

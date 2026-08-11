@@ -2,18 +2,22 @@
 #extension GL_EXT_control_flow_attributes : require
 
 //
-// Single-source SGEMM kernel: C[MxN] = A[MxK] * B[KxN]  (row-major, fp32)
+// Single-source SGEMM kernel: C[MxN] = A[MxK] * B[KxN]  (fp32)
 //
-// The four benchmark variants are produced from this one file by toggling
-// USE_SHARED_A / USE_SHARED_B at SPIR-V compile time. The loop structure,
-// tiling and register blocking are IDENTICAL in all four variants, so the
-// only thing being measured is whether the A / B operand is staged through
-// workgroup shared memory (LDS) or re-read from global memory every step.
+// Every benchmark variant is produced from this one file by toggling defines at
+// SPIR-V compile time. Everything not being toggled -- tiling, register
+// blocking, loop order, FMA order -- stays identical, so a measured difference
+// is attributable to the toggled axis alone.
 //
-//   USE_SHARED_A=0 USE_SHARED_B=0  ->  "none"      (no shared memory at all)
-//   USE_SHARED_A=1 USE_SHARED_B=0  ->  "shared_a"  (A tiled in LDS, B global)
-//   USE_SHARED_A=0 USE_SHARED_B=1  ->  "shared_b"  (B tiled in LDS, A global)
-//   USE_SHARED_A=1 USE_SHARED_B=1  ->  "shared_ab" (both tiled in LDS)
+//   USE_SHARED_A / USE_SHARED_B   operand staging
+//     0 / 0  ->  "none"       (no shared memory at all)
+//     1 / 0  ->  "shared_a"   (A tiled in LDS, B from global)
+//     0 / 1  ->  "shared_b"   (B tiled in LDS, A from global)
+//     1 / 1  ->  "shared_ab"  (both tiled in LDS)
+//
+//   A_COL_MAJOR    storage order of A (B and C are always row-major)
+//   TM / TN        micro-tile computed per invocation
+//   DOUBLE_BUFFER  ping-pong the LDS tiles (only meaningful with USE_LDS)
 //
 
 #ifndef TS
@@ -29,8 +33,8 @@
 #define BK 16          // depth of one K-tile
 #endif
 
-#define BM (TS * TM)   // rows of C per workgroup  (64)
-#define BN (TS * TN)   // cols of C per workgroup  (64)
+#define BM (TS * TM)   // rows of C per workgroup
+#define BN (TS * TN)   // cols of C per workgroup
 #define NTHREADS (TS * TS)
 
 #ifndef USE_SHARED_A
@@ -39,8 +43,16 @@
 #ifndef USE_SHARED_B
 #define USE_SHARED_B 0
 #endif
+#ifndef DOUBLE_BUFFER
+#define DOUBLE_BUFFER 0
+#endif
 
-// Storage order of A. B and C are always row-major.
+#define USE_LDS (USE_SHARED_A || USE_SHARED_B)
+// Double buffering is a property of the LDS staging; with no LDS there is
+// nothing to ping-pong and the flag collapses to the plain path.
+#define DB (DOUBLE_BUFFER && USE_LDS)
+
+// Storage order of A.
 //   row-major : element (m,k) at A[m*K + k], leading dimension K
 //   col-major : element (m,k) at A[k*M + m], leading dimension M
 //               i.e. the host uploads A transposed
@@ -59,8 +71,6 @@
 #define A_AT(m, k) A[(m) * p.K + (k)]
 #endif
 
-#define USE_LDS (USE_SHARED_A || USE_SHARED_B)
-
 layout(local_size_x = TS, local_size_y = TS, local_size_z = 1) in;
 
 layout(push_constant) uniform Params {
@@ -73,9 +83,10 @@ layout(std430, binding = 0) readonly  buffer BufA { float A[]; };
 layout(std430, binding = 1) readonly  buffer BufB { float B[]; };
 layout(std430, binding = 2) writeonly buffer BufC { float C[]; };
 
-#if USE_SHARED_A
-// Held as As[k][m] so the inner loop broadcasts across a subgroup. From a
-// row-major A the staging store transposes, and consecutive invocations would
+// --- LDS tiles --------------------------------------------------------------
+//
+// Held as [k][m] / [k][n] so the inner loop broadcasts across a subgroup. From
+// a row-major A the staging store transposes and consecutive invocations would
 // all land on one bank; the pad breaks that up. A column-major A already
 // stores to consecutive words, so it needs no pad.
 #if A_COL_MAJOR
@@ -83,11 +94,41 @@ layout(std430, binding = 2) writeonly buffer BufC { float C[]; };
 #else
 #define AS_PAD 4
 #endif
+
+#if DB
+#  if USE_SHARED_A
+shared float As[2][BK][BM + AS_PAD];
+#  endif
+#  if USE_SHARED_B
+shared float Bs[2][BK][BN];
+#  endif
+#  define AS(buf, k, m) As[buf][k][m]
+#  define BS(buf, k, n) Bs[buf][k][n]
+#else
+#  if USE_SHARED_A
 shared float As[BK][BM + AS_PAD];
-#endif
-#if USE_SHARED_B
+#  endif
+#  if USE_SHARED_B
 shared float Bs[BK][BN];
+#  endif
+#  define AS(buf, k, m) As[k][m]
+#  define BS(buf, k, n) Bs[k][n]
 #endif
+
+// Tile-load index decomposition. idx is laid out so consecutive invocations
+// touch consecutive addresses of the operand: along k for a row-major A, along
+// m for a column-major A, along n for B.
+#if A_COL_MAJOR
+#define A_DECOMP(idx) uint kk = (idx) / BM; uint mm = (idx) - kk * BM;
+#else
+#define A_DECOMP(idx) uint mm = (idx) / BK; uint kk = (idx) - mm * BK;
+#endif
+#define B_DECOMP(idx) uint kk = (idx) / BN; uint nn = (idx) - kk * BN;
+
+// A tile is BK*BM elements over NTHREADS invocations; both divide exactly for
+// every tile size built here, so these are the per-invocation load counts.
+#define A_LOADS ((BK * BM) / NTHREADS)
+#define B_LOADS ((BK * BN) / NTHREADS)
 
 void main()
 {
@@ -109,67 +150,143 @@ void main()
     float regA[TM];
     float regB[TN];
 
-    for (uint kt = 0; kt < p.K; kt += BK) {
-#if USE_LDS
-        barrier();   // previous iteration must be done reading the tiles
-#endif
+// --- staging macros ---------------------------------------------------------
+// Written once and used by both the prologue and the loop body, so the two can
+// never drift apart.
 
 #if USE_SHARED_A
-        // BK*BM elements over NTHREADS invocations. idx is decomposed so that
-        // consecutive invocations read consecutive addresses of A whichever way
-        // A is stored: along k when row-major, along m when column-major.
-        [[unroll]] for (uint idx = tid; idx < BK * BM; idx += NTHREADS) {
-#if A_COL_MAJOR
-            uint kk = idx / BM;
-            uint mm = idx - kk * BM;
-#else
-            uint mm = idx / BK;
-            uint kk = idx - mm * BK;
-#endif
-            As[kk][mm] = A_AT(blockRow + mm, kt + kk);
-        }
-#endif
-#if USE_SHARED_B
-        // Consecutive invocations read consecutive columns of B (coalesced)
-        // and write consecutive LDS addresses (conflict free).
-        [[unroll]] for (uint idx = tid; idx < BK * BN; idx += NTHREADS) {
-            uint kk = idx / BN;
-            uint nn = idx - kk * BN;
-            Bs[kk][nn] = B[(kt + kk) * p.N + blockCol + nn];
-        }
-#endif
-
-#if USE_LDS
-        barrier();
-#endif
-
-        [[unroll]] for (uint kk = 0; kk < BK; ++kk) {
-            [[unroll]] for (int i = 0; i < TM; ++i) {
-#if USE_SHARED_A
-                regA[i] = As[kk][threadRow + i];
-#else
-                regA[i] = A_AT(gRow + i, kt + kk);
-#endif
-            }
-            [[unroll]] for (int j = 0; j < TN; ++j) {
-#if USE_SHARED_B
-                regB[j] = Bs[kk][threadCol + j];
-#else
-                regB[j] = B[(kt + kk) * p.N + gCol + j];
-#endif
-            }
-            [[unroll]] for (int i = 0; i < TM; ++i)
-                [[unroll]] for (int j = 0; j < TN; ++j)
-                    acc[i][j] = fma(regA[i], regB[j], acc[i][j]);
-        }
+#define LOAD_A_TO_LDS(BUF, KT)                                                 \
+    [[unroll]] for (uint q = 0; q < A_LOADS; ++q) {                            \
+        uint idx = tid + q * NTHREADS;                                         \
+        A_DECOMP(idx)                                                          \
+        AS(BUF, kk, mm) = A_AT(blockRow + mm, (KT) + kk);                      \
     }
+#define PREFETCH_A(KT)                                                         \
+    [[unroll]] for (uint q = 0; q < A_LOADS; ++q) {                            \
+        uint idx = tid + q * NTHREADS;                                         \
+        A_DECOMP(idx)                                                          \
+        preA[q] = A_AT(blockRow + mm, (KT) + kk);                              \
+    }
+#define STORE_A(BUF)                                                           \
+    [[unroll]] for (uint q = 0; q < A_LOADS; ++q) {                            \
+        uint idx = tid + q * NTHREADS;                                         \
+        A_DECOMP(idx)                                                          \
+        AS(BUF, kk, mm) = preA[q];                                             \
+    }
+#else
+#define LOAD_A_TO_LDS(BUF, KT)
+#define PREFETCH_A(KT)
+#define STORE_A(BUF)
+#endif
+
+#if USE_SHARED_B
+#define LOAD_B_TO_LDS(BUF, KT)                                                 \
+    [[unroll]] for (uint q = 0; q < B_LOADS; ++q) {                            \
+        uint idx = tid + q * NTHREADS;                                         \
+        B_DECOMP(idx)                                                          \
+        BS(BUF, kk, nn) = B[((KT) + kk) * p.N + blockCol + nn];                \
+    }
+#define PREFETCH_B(KT)                                                         \
+    [[unroll]] for (uint q = 0; q < B_LOADS; ++q) {                            \
+        uint idx = tid + q * NTHREADS;                                         \
+        B_DECOMP(idx)                                                          \
+        preB[q] = B[((KT) + kk) * p.N + blockCol + nn];                        \
+    }
+#define STORE_B(BUF)                                                           \
+    [[unroll]] for (uint q = 0; q < B_LOADS; ++q) {                            \
+        uint idx = tid + q * NTHREADS;                                         \
+        B_DECOMP(idx)                                                          \
+        BS(BUF, kk, nn) = preB[q];                                             \
+    }
+#else
+#define LOAD_B_TO_LDS(BUF, KT)
+#define PREFETCH_B(KT)
+#define STORE_B(BUF)
+#endif
+
+#if USE_SHARED_A
+#define GET_A(BUF, KT, KK, I) AS(BUF, KK, threadRow + (I))
+#else
+#define GET_A(BUF, KT, KK, I) A_AT(gRow + (I), (KT) + (KK))
+#endif
+#if USE_SHARED_B
+#define GET_B(BUF, KT, KK, J) BS(BUF, KK, threadCol + (J))
+#else
+#define GET_B(BUF, KT, KK, J) B[((KT) + (KK)) * p.N + gCol + (J)]
+#endif
+
+#define COMPUTE_TILE(BUF, KT)                                                  \
+    [[unroll]] for (uint kk = 0; kk < BK; ++kk) {                              \
+        [[unroll]] for (int i = 0; i < TM; ++i)                                \
+            regA[i] = GET_A(BUF, KT, kk, i);                                   \
+        [[unroll]] for (int j = 0; j < TN; ++j)                                \
+            regB[j] = GET_B(BUF, KT, kk, j);                                   \
+        [[unroll]] for (int i = 0; i < TM; ++i)                                \
+            [[unroll]] for (int j = 0; j < TN; ++j)                            \
+                acc[i][j] = fma(regA[i], regB[j], acc[i][j]);                  \
+    }
+
+// --- main loop --------------------------------------------------------------
+
+#if DB
+    // Ping-pong the LDS tiles. Tile kt is read out of buffer `cur` while tile
+    // kt+BK is fetched from global into registers and written to buffer cur^1.
+    // The two never alias, so one barrier per iteration suffices instead of
+    // two: it both publishes the writes to cur^1 and confirms every invocation
+    // has finished reading cur, which the iteration after next will overwrite.
+#  if USE_SHARED_A
+    float preA[A_LOADS];
+#  endif
+#  if USE_SHARED_B
+    float preB[B_LOADS];
+#  endif
+
+    LOAD_A_TO_LDS(0, 0)
+    LOAD_B_TO_LDS(0, 0)
+    barrier();
+
+    uint cur = 0;
+    for (uint kt = 0; kt < p.K; kt += BK) {
+        // Uniform across the workgroup, so the barrier below stays in uniform
+        // control flow.
+        bool hasNext = (kt + BK) < p.K;
+
+        // Issued before the FMAs so the global latency overlaps with compute.
+        if (hasNext) {
+            PREFETCH_A(kt + BK)
+            PREFETCH_B(kt + BK)
+        }
+
+        COMPUTE_TILE(cur, kt)
+
+        if (hasNext) {
+            STORE_A(cur ^ 1)
+            STORE_B(cur ^ 1)
+        }
+        barrier();
+        cur ^= 1;
+    }
+#else
+    const uint cur = 0;
+    for (uint kt = 0; kt < p.K; kt += BK) {
+#  if USE_LDS
+        barrier();   // previous iteration must be done reading the tiles
+#  endif
+        LOAD_A_TO_LDS(cur, kt)
+        LOAD_B_TO_LDS(cur, kt)
+#  if USE_LDS
+        barrier();
+#  endif
+        COMPUTE_TILE(cur, kt)
+    }
+#endif
 
     // The dispatch grid is rounded up, because a block tile need not divide the
     // matrix -- TM=6 gives BM=96, which never divides a power-of-two size. The
     // loads above are allowed to run past M/N into the buffers' allocated slack
     // (harmless: those results are discarded), so only the store is guarded.
     // This sits outside the k loop, one predicate per output element against
-    // K*TM*TN fused multiply-adds, and is identical in all four variants.
+    // K*TM*TN fused multiply-adds, and is identical in all variants.
     [[unroll]] for (uint i = 0; i < TM; ++i) {
         if (gRow + i >= p.M) continue;
         [[unroll]] for (uint j = 0; j < TN; ++j) {

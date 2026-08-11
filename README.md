@@ -35,13 +35,41 @@ which is also the check that the transpose itself is correct.
 **Tiling:** workgroup is fixed at 16×16 invocations with a K-tile depth of 16.
 The micro-tile each invocation computes is a build-time parameter: `TM`×`TN`
 for `TM,TN ∈ {4,6,8}`, giving a block tile of `16·TM` × `16·TN`. All nine pairs
-are built for all four staging variants and both A layouts — 72 kernels
-embedded — so `--sweep` compares tiling and staging independently.
+are built for all four staging variants, both A layouts and both double-buffer
+modes — 126 kernels embedded — so `--sweep` compares tiling, staging, layout
+and buffering independently.
 
 Larger micro-tiles raise arithmetic intensity: per k-step a kernel issues
 `TM+TN` operand loads against `TM·TN` FMAs, so 4×4 does 2 FMA per load while
 8×8 does 4. The cost is register pressure (`acc[8][8]` is 64 accumulators) and
 lower occupancy, which is the tradeoff the sweep measures.
+
+**LDS double buffering.** With `--double-buffer on`, the shared-memory tiles are
+ping-ponged: tile `kt` is read out of buffer `cur` while tile `kt+BK` is fetched
+from global into registers and written to buffer `cur^1`. Because the two
+buffers never alias, **one barrier per k-iteration suffices instead of two** —
+it both publishes the writes to `cur^1` and confirms every invocation has
+finished reading `cur`. Verified in the SPIR-V: the single-buffered kernel has
+both `OpControlBarrier`s inside the k loop, the double-buffered one has a
+prologue barrier outside it and only one inside.
+
+The prefetch is issued before the FMAs so the global load latency overlaps with
+compute. What it costs is registers and LDS:
+
+| shared_ab 8×8, A-col | single | double |
+|---|---|---|
+| barriers per k-iteration | 2 | 1 |
+| LDS | 16384 B | 32768 B |
+| prefetch registers held across compute | 0 | 16 |
+
+Doubling LDS and adding 16 live registers on top of `acc[8][8]` cuts occupancy,
+so double buffering is not automatically a win — which is why it is a
+comparison axis (`off` / `on` / `both`, default `both`) rather than a
+replacement. Combinations that no longer fit in the device's shared memory are
+skipped with a printed reason instead of aborting the run; `shared_ab` 8×8 with
+a row-major A needs 33280 B and will be dropped on a 32 KiB device.
+
+`none` has no LDS, so it has no double-buffered build at all.
 
 **Partial tiles.** A block tile need not divide the matrix — `TM=6` gives a
 block of 96, and 96 never divides a power-of-two size. The dispatch grid is
@@ -169,6 +197,7 @@ adb shell /data/local/tmp/gemm_vk_bench --mode perf
 --kernels <list>      subset of none,shared_a,shared_b,shared_ab
 --tile <TMxTN>        micro-tile per invocation, default 4x4. Repeatable.
 --a-layout <l>        storage order of A: col (default), row, or both
+--double-buffer <d>   LDS tile ping-pong: both (default), on, or off
 --sweep               run every built (TM,TN) pair and rank the results
 --samples <n>         check mode: elements verified against CPU (default 4096)
 --full-check          check mode: verify the whole matrix on CPU (slow)
