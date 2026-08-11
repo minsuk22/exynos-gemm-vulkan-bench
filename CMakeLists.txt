@@ -9,22 +9,33 @@ endif()
 
 # --- SPIR-V generation -------------------------------------------------------
 # Each kernel variant comes from the same shaders/gemm.comp, toggled with -D.
-# glslangValidator emits a C header (`const uint32_t <name>_spv[]`) so the
-# shaders end up embedded in the executable and we ship a single file.
+#
+# -O is NOT optional here. glslangValidator/glslc without it emit a fully rolled
+# loop nest with acc[TM][TN], regA[] and regB[] left as function-local arrays
+# indexed by loop variables; drivers park those in scratch memory and every FMA
+# turns into a memory round trip (measured: ~0.0008 TFLOPS). With -O the loops
+# unroll, the arrays become SSA values, and the inner loop is 256 flat FMAs.
+#
+# glslc is used rather than glslangValidator because it runs spirv-opt itself
+# and ships inside the NDK, so no separate glslang install is needed.
 
-find_program(GLSLANG_VALIDATOR
-  NAMES glslangValidator glslangValidator.exe
-  HINTS ${GLSLANG_DIR} $ENV{GLSLANG_DIR} ENV VULKAN_SDK
-  PATH_SUFFIXES bin Bin)
-if(NOT GLSLANG_VALIDATOR)
-  message(FATAL_ERROR "glslangValidator not found. Pass -DGLSLANG_VALIDATOR=<path>.")
+find_program(GLSLC
+  NAMES glslc glslc.exe
+  HINTS ${GLSLC_DIR} $ENV{GLSLC_DIR}
+        ${ANDROID_NDK}/shader-tools/${ANDROID_HOST_TAG}
+        ${ANDROID_NDK}/shader-tools
+        ENV VULKAN_SDK
+  PATH_SUFFIXES bin windows-x86_64 linux-x86_64 darwin-x86_64)
+if(NOT GLSLC)
+  message(FATAL_ERROR "glslc not found. It ships in the NDK under "
+                      "shader-tools/<host>/; pass -DGLSLC=<path> to override.")
 endif()
-message(STATUS "glslangValidator: ${GLSLANG_VALIDATOR}")
+message(STATUS "glslc: ${GLSLC}")
 
 set(GEN_DIR ${CMAKE_CURRENT_BINARY_DIR}/gen)
 file(MAKE_DIRECTORY ${GEN_DIR})
 set(SHADER_SRC ${CMAKE_CURRENT_SOURCE_DIR}/shaders/gemm.comp)
-set(SPV_HEADERS "")
+set(SPV_INCS "")
 
 #            variant name   USE_SHARED_A  USE_SHARED_B
 set(VARIANTS "none:0:0" "shared_a:1:0" "shared_b:0:1" "shared_ab:1:1")
@@ -34,19 +45,20 @@ foreach(v IN LISTS VARIANTS)
   list(GET parts 0 vname)
   list(GET parts 1 usea)
   list(GET parts 2 useb)
-  set(hdr ${GEN_DIR}/gemm_${vname}.h)
+  set(inc ${GEN_DIR}/gemm_${vname}.inc)
+  # -mfmt=c emits a braced uint32 initializer list, included directly by main.cpp
   add_custom_command(
-    OUTPUT  ${hdr}
-    COMMAND ${GLSLANG_VALIDATOR} -V --target-env vulkan1.1
+    OUTPUT  ${inc}
+    COMMAND ${GLSLC} -O --target-env=vulkan1.1 -fshader-stage=compute
             -DUSE_SHARED_A=${usea} -DUSE_SHARED_B=${useb}
-            --vn gemm_${vname}_spv -o ${hdr} ${SHADER_SRC}
+            -mfmt=c -o ${inc} ${SHADER_SRC}
     DEPENDS ${SHADER_SRC}
-    COMMENT "glslangValidator gemm.comp -> gemm_${vname}.h (A_shared=${usea} B_shared=${useb})"
+    COMMENT "glslc -O gemm.comp -> gemm_${vname}.inc (A_shared=${usea} B_shared=${useb})"
     VERBATIM)
-  list(APPEND SPV_HEADERS ${hdr})
+  list(APPEND SPV_INCS ${inc})
 endforeach()
 
-add_custom_target(gemm_shaders DEPENDS ${SPV_HEADERS})
+add_custom_target(gemm_shaders DEPENDS ${SPV_INCS})
 
 # --- executable --------------------------------------------------------------
 add_executable(gemm_vk_bench src/main.cpp)

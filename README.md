@@ -40,13 +40,36 @@ adb shell /data/local/tmp/gemm_vk_bench --mode check --sizes 2048 --iters 2
 
 ## Build
 
-Requires the Android NDK, CMake + Ninja, and `glslangValidator`. Defaults point
-at this machine's install; override with parameters if yours differ.
+Requires the Android NDK and CMake + Ninja. `glslc` comes from the NDK
+(`shader-tools/<host>/`), so there is no separate shader compiler to install.
+Defaults point at this machine's install; override with parameters if yours
+differ.
 
 ```powershell
 .\build.ps1
-# .\build.ps1 -Clean -NdkDir "C:\path\to\ndk" -GlslangDir "C:\VulkanSDK\1.3.x"
+# .\build.ps1 -Clean -NdkDir "C:\path\to\ndk"
 ```
+
+### `-O` on the shader is mandatory
+
+`glslc`/`glslangValidator` without `-O` emit a fully rolled loop nest and leave
+`acc[TM][TN]`, `regA[]` and `regB[]` as function-local arrays indexed by loop
+variables. Drivers park those in scratch memory, so every FMA becomes a memory
+round trip — measured at **0.0008 TFLOPS**, roughly a 1000x loss. `[[unroll]]`
+in the GLSL is only a hint and does not prevent this.
+
+With `-O` the loops unroll, the arrays are promoted to SSA values, and the
+inner loop becomes 256 flat FMAs with no function-local storage at all:
+
+| | no `-O` | `-O` |
+|---|---|---|
+| `OpFma` | 1 | 256 |
+| `TypePointer Function` | 5 | 0 |
+| `OpLoopMerge` | 12 | 3 |
+
+If you change the build, verify with
+`spirv-dis foo.spv | grep -c Fma` — anything other than 256 for the default
+tiling means the unroll did not happen.
 
 Output: `out\gemm_vk_bench` — a single self-contained arm64-v8a PIE. The SPIR-V
 for all four kernels is embedded in the binary (no shader files to push), and

@@ -10,7 +10,6 @@ param(
     [string]$NdkDir     = "D:\Android\sdk\ndk\26.3.11579264",
     [string]$CMakeExe   = "D:\Android\sdk\cmake\3.22.1\bin\cmake.exe",
     [string]$NinjaExe   = "D:\Android\sdk\cmake\3.22.1\bin\ninja.exe",
-    [string]$GlslangDir = "D:\Android\glslang",
     [string]$Abi        = "arm64-v8a",
     [string]$ApiLevel   = "26",
     [switch]$Clean
@@ -21,9 +20,12 @@ $root     = $PSScriptRoot
 $buildDir = Join-Path $root "build\android-$Abi"
 $outDir   = Join-Path $root "out"
 
-foreach ($p in @($NdkDir, $CMakeExe, $NinjaExe, $GlslangDir)) {
+foreach ($p in @($NdkDir, $CMakeExe, $NinjaExe)) {
     if (-not (Test-Path $p)) { throw "not found: $p" }
 }
+# glslc ships inside the NDK; CMake finds it there.
+$glslc = Join-Path $NdkDir "shader-tools\windows-x86_64\glslc.exe"
+if (-not (Test-Path $glslc)) { throw "glslc not found in NDK: $glslc" }
 $toolchain = Join-Path $NdkDir "build\cmake\android.toolchain.cmake"
 if (-not (Test-Path $toolchain)) { throw "NDK toolchain file not found: $toolchain" }
 
@@ -39,7 +41,7 @@ Write-Host "==> configuring ($Abi, android-$ApiLevel)" -ForegroundColor Cyan
     "-DANDROID_PLATFORM=android-$ApiLevel" `
     "-DANDROID_STL=c++_static" `
     "-DCMAKE_BUILD_TYPE=Release" `
-    "-DGLSLANG_DIR=$GlslangDir"
+    "-DGLSLC=$glslc"
 if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
 
 Write-Host "==> building" -ForegroundColor Cyan
