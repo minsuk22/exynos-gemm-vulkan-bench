@@ -16,11 +16,27 @@ compile time with `-DUSE_SHARED_A` / `-DUSE_SHARED_B`. Tiling, register
 blocking, loop order and FMA order are identical, so the delta you measure is
 the operand-staging strategy and nothing else.
 
+**A storage order.** A is column-major by default — the host uploads it
+transposed, so element (m,k) sits at `A[k*M + m]` (B and C stay row-major).
+This makes the m direction contiguous, which is the direction the inner loop
+walks:
+
+| | row-major A | column-major A |
+|---|---|---|
+| `regA[0..TM-1]` in the non-shared path | stride K apart — TM separate cache lines | one contiguous run |
+| LDS staging store | transposes, so a `+4` pad is needed to break the bank conflict | already consecutive, no pad |
+| LDS at 8×8 `shared_ab` | 16640 B | 16384 B |
+
+`--a-layout row` reverts to the original order and `--a-layout both` runs the
+two side by side. Because the k accumulation order is unchanged, the two
+layouts must produce bit-identical results — `--mode check` verifies that,
+which is also the check that the transpose itself is correct.
+
 **Tiling:** workgroup is fixed at 16×16 invocations with a K-tile depth of 16.
 The micro-tile each invocation computes is a build-time parameter: `TM`×`TN`
 for `TM,TN ∈ {4,6,8}`, giving a block tile of `16·TM` × `16·TN`. All nine pairs
-are built for all four staging variants — 36 kernels embedded — so `--sweep`
-compares tiling and staging independently.
+are built for all four staging variants and both A layouts — 72 kernels
+embedded — so `--sweep` compares tiling and staging independently.
 
 Larger micro-tiles raise arithmetic intensity: per k-step a kernel issues
 `TM+TN` operand loads against `TM·TN` FMAs, so 4×4 does 2 FMA per load while
@@ -152,6 +168,7 @@ adb shell /data/local/tmp/gemm_vk_bench --mode perf
 --warmup <n>          untimed warmup iterations (default 2)
 --kernels <list>      subset of none,shared_a,shared_b,shared_ab
 --tile <TMxTN>        micro-tile per invocation, default 4x4. Repeatable.
+--a-layout <l>        storage order of A: col (default), row, or both
 --sweep               run every built (TM,TN) pair and rank the results
 --samples <n>         check mode: elements verified against CPU (default 4096)
 --full-check          check mode: verify the whole matrix on CPU (slow)

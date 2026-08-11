@@ -1,5 +1,5 @@
 ﻿cmake_minimum_required(VERSION 3.18)
-project(gemm_vk_bench VERSION 0.2.0 LANGUAGES CXX)
+project(gemm_vk_bench VERSION 0.3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -50,43 +50,53 @@ set(TABLE_H ${GEN_DIR}/shaders_table.h)
 set(TBL_DECLS "")
 set(TBL_ROWS "")
 
-foreach(tm IN LISTS TILE_M)
-  foreach(tn IN LISTS TILE_N)
-    foreach(v IN LISTS VARIANTS)
-      string(REPLACE ":" ";" parts ${v})
-      list(GET parts 0 vname)
-      list(GET parts 1 usea)
-      list(GET parts 2 useb)
-      if(usea)
-        set(asrc "shared")
-      else()
-        set(asrc "global")
-      endif()
-      if(useb)
-        set(bsrc "shared")
-      else()
-        set(bsrc "global")
-      endif()
+# Storage order of A. B and C are always row-major.
+#            suffix : A_COL_MAJOR : label
+set(A_LAYOUTS "acol:1:col" "arow:0:row")
 
-      set(stem gemm_${vname}_${tm}x${tn})
-      set(inc ${GEN_DIR}/${stem}.inc)
-      # -mfmt=c emits a braced uint32 initializer list, included as an initializer
-      add_custom_command(
-        OUTPUT  ${inc}
-        COMMAND ${GLSLC} -O --target-env=vulkan1.1 -fshader-stage=compute
-                -DUSE_SHARED_A=${usea} -DUSE_SHARED_B=${useb}
-                -DTM=${tm} -DTN=${tn}
-                -mfmt=c -o ${inc} ${SHADER_SRC}
-        DEPENDS ${SHADER_SRC}
-        COMMENT "glslc -O gemm.comp -> ${stem}.inc (A=${asrc} B=${bsrc} ${tm}x${tn})"
-        VERBATIM)
-      list(APPEND SPV_INCS ${inc})
+foreach(lay IN LISTS A_LAYOUTS)
+  string(REPLACE ":" ";" lparts ${lay})
+  list(GET lparts 0 lsuffix)
+  list(GET lparts 1 lcol)
+  list(GET lparts 2 llabel)
+  foreach(tm IN LISTS TILE_M)
+    foreach(tn IN LISTS TILE_N)
+      foreach(v IN LISTS VARIANTS)
+        string(REPLACE ":" ";" parts ${v})
+        list(GET parts 0 vname)
+        list(GET parts 1 usea)
+        list(GET parts 2 useb)
+        if(usea)
+          set(asrc "shared")
+        else()
+          set(asrc "global")
+        endif()
+        if(useb)
+          set(bsrc "shared")
+        else()
+          set(bsrc "global")
+        endif()
 
-      string(APPEND TBL_DECLS
-        "static const uint32_t ${stem}_spv[] =\n#include \"${stem}.inc\"\n;\n")
-      string(APPEND TBL_ROWS
-        "  { \"${vname}\", \"${asrc}\", \"${bsrc}\", ${tm}, ${tn}, "
-        "${stem}_spv, sizeof(${stem}_spv) }, \\\n")
+        set(stem gemm_${vname}_${tm}x${tn}_${lsuffix})
+        set(inc ${GEN_DIR}/${stem}.inc)
+        # -mfmt=c emits a braced uint32 initializer list, used as an initializer
+        add_custom_command(
+          OUTPUT  ${inc}
+          COMMAND ${GLSLC} -O --target-env=vulkan1.1 -fshader-stage=compute
+                  -DUSE_SHARED_A=${usea} -DUSE_SHARED_B=${useb}
+                  -DTM=${tm} -DTN=${tn} -DA_COL_MAJOR=${lcol}
+                  -mfmt=c -o ${inc} ${SHADER_SRC}
+          DEPENDS ${SHADER_SRC}
+          COMMENT "glslc -O gemm.comp -> ${stem}.inc (A=${asrc} B=${bsrc} ${tm}x${tn} A_${llabel})"
+          VERBATIM)
+        list(APPEND SPV_INCS ${inc})
+
+        string(APPEND TBL_DECLS
+          "static const uint32_t ${stem}_spv[] =\n#include \"${stem}.inc\"\n;\n")
+        string(APPEND TBL_ROWS
+          "  { \"${vname}\", \"${asrc}\", \"${bsrc}\", \"${llabel}\", ${tm}, ${tn}, "
+          "${stem}_spv, sizeof(${stem}_spv) }, \\\n")
+      endforeach()
     endforeach()
   endforeach()
 endforeach()

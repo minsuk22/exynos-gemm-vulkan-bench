@@ -40,6 +40,25 @@
 #define USE_SHARED_B 0
 #endif
 
+// Storage order of A. B and C are always row-major.
+//   row-major : element (m,k) at A[m*K + k], leading dimension K
+//   col-major : element (m,k) at A[k*M + m], leading dimension M
+//               i.e. the host uploads A transposed
+//
+// Column-major makes the m direction contiguous, which is the direction the
+// inner loop walks: regA[0..TM-1] becomes one contiguous run instead of TM
+// separate cache lines K floats apart, and the LDS staging store lands on
+// consecutive words instead of needing a transpose.
+#ifndef A_COL_MAJOR
+#define A_COL_MAJOR 0
+#endif
+
+#if A_COL_MAJOR
+#define A_AT(m, k) A[(k) * p.M + (m)]
+#else
+#define A_AT(m, k) A[(m) * p.K + (k)]
+#endif
+
 #define USE_LDS (USE_SHARED_A || USE_SHARED_B)
 
 layout(local_size_x = TS, local_size_y = TS, local_size_z = 1) in;
@@ -55,9 +74,16 @@ layout(std430, binding = 1) readonly  buffer BufB { float B[]; };
 layout(std430, binding = 2) writeonly buffer BufC { float C[]; };
 
 #if USE_SHARED_A
-// Transposed (As[k][m]) so the inner loop broadcasts across a subgroup.
-// The +4 pad breaks the LDS bank conflict created by the transposing store.
-shared float As[BK][BM + 4];
+// Held as As[k][m] so the inner loop broadcasts across a subgroup. From a
+// row-major A the staging store transposes, and consecutive invocations would
+// all land on one bank; the pad breaks that up. A column-major A already
+// stores to consecutive words, so it needs no pad.
+#if A_COL_MAJOR
+#define AS_PAD 0
+#else
+#define AS_PAD 4
+#endif
+shared float As[BK][BM + AS_PAD];
 #endif
 #if USE_SHARED_B
 shared float Bs[BK][BN];
@@ -89,12 +115,18 @@ void main()
 #endif
 
 #if USE_SHARED_A
-        // BK*BM elements over NTHREADS invocations. idx is laid out so that
-        // consecutive invocations read consecutive addresses of A (coalesced).
+        // BK*BM elements over NTHREADS invocations. idx is decomposed so that
+        // consecutive invocations read consecutive addresses of A whichever way
+        // A is stored: along k when row-major, along m when column-major.
         [[unroll]] for (uint idx = tid; idx < BK * BM; idx += NTHREADS) {
+#if A_COL_MAJOR
+            uint kk = idx / BM;
+            uint mm = idx - kk * BM;
+#else
             uint mm = idx / BK;
             uint kk = idx - mm * BK;
-            As[kk][mm] = A[(blockRow + mm) * p.K + kt + kk];
+#endif
+            As[kk][mm] = A_AT(blockRow + mm, kt + kk);
         }
 #endif
 #if USE_SHARED_B
@@ -116,7 +148,7 @@ void main()
 #if USE_SHARED_A
                 regA[i] = As[kk][threadRow + i];
 #else
-                regA[i] = A[(gRow + i) * p.K + kt + kk];
+                regA[i] = A_AT(gRow + i, kt + kk);
 #endif
             }
             [[unroll]] for (int j = 0; j < TN; ++j) {
