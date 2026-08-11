@@ -1,0 +1,138 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+
+//
+// Single-source SGEMM kernel: C[MxN] = A[MxK] * B[KxN]  (row-major, fp32)
+//
+// The four benchmark variants are produced from this one file by toggling
+// USE_SHARED_A / USE_SHARED_B at SPIR-V compile time. The loop structure,
+// tiling and register blocking are IDENTICAL in all four variants, so the
+// only thing being measured is whether the A / B operand is staged through
+// workgroup shared memory (LDS) or re-read from global memory every step.
+//
+//   USE_SHARED_A=0 USE_SHARED_B=0  ->  "none"      (no shared memory at all)
+//   USE_SHARED_A=1 USE_SHARED_B=0  ->  "shared_a"  (A tiled in LDS, B global)
+//   USE_SHARED_A=0 USE_SHARED_B=1  ->  "shared_b"  (B tiled in LDS, A global)
+//   USE_SHARED_A=1 USE_SHARED_B=1  ->  "shared_ab" (both tiled in LDS)
+//
+
+#ifndef TS
+#define TS 16          // workgroup is TS x TS invocations
+#endif
+#ifndef TM
+#define TM 4           // rows of C computed per invocation
+#endif
+#ifndef TN
+#define TN 4           // cols of C computed per invocation
+#endif
+#ifndef BK
+#define BK 16          // depth of one K-tile
+#endif
+
+#define BM (TS * TM)   // rows of C per workgroup  (64)
+#define BN (TS * TN)   // cols of C per workgroup  (64)
+#define NTHREADS (TS * TS)
+
+#ifndef USE_SHARED_A
+#define USE_SHARED_A 0
+#endif
+#ifndef USE_SHARED_B
+#define USE_SHARED_B 0
+#endif
+
+#define USE_LDS (USE_SHARED_A || USE_SHARED_B)
+
+layout(local_size_x = TS, local_size_y = TS, local_size_z = 1) in;
+
+layout(push_constant) uniform Params {
+    uint M;
+    uint N;
+    uint K;
+} p;
+
+layout(std430, binding = 0) readonly  buffer BufA { float A[]; };
+layout(std430, binding = 1) readonly  buffer BufB { float B[]; };
+layout(std430, binding = 2) writeonly buffer BufC { float C[]; };
+
+#if USE_SHARED_A
+// Transposed (As[k][m]) so the inner loop broadcasts across a subgroup.
+// The +4 pad breaks the LDS bank conflict created by the transposing store.
+shared float As[BK][BM + 4];
+#endif
+#if USE_SHARED_B
+shared float Bs[BK][BN];
+#endif
+
+void main()
+{
+    const uint tid       = gl_LocalInvocationID.y * TS + gl_LocalInvocationID.x;
+    const uint blockRow  = gl_WorkGroupID.y * BM;
+    const uint blockCol  = gl_WorkGroupID.x * BN;
+    const uint threadRow = gl_LocalInvocationID.y * TM;   // offset inside the block tile
+    const uint threadCol = gl_LocalInvocationID.x * TN;
+
+    // Global row/col of this invocation's first output element.
+    const uint gRow = blockRow + threadRow;
+    const uint gCol = blockCol + threadCol;
+
+    float acc[TM][TN];
+    [[unroll]] for (int i = 0; i < TM; ++i)
+        [[unroll]] for (int j = 0; j < TN; ++j)
+            acc[i][j] = 0.0;
+
+    float regA[TM];
+    float regB[TN];
+
+    for (uint kt = 0; kt < p.K; kt += BK) {
+#if USE_LDS
+        barrier();   // previous iteration must be done reading the tiles
+#endif
+
+#if USE_SHARED_A
+        // BK*BM elements over NTHREADS invocations. idx is laid out so that
+        // consecutive invocations read consecutive addresses of A (coalesced).
+        [[unroll]] for (uint idx = tid; idx < BK * BM; idx += NTHREADS) {
+            uint mm = idx / BK;
+            uint kk = idx - mm * BK;
+            As[kk][mm] = A[(blockRow + mm) * p.K + kt + kk];
+        }
+#endif
+#if USE_SHARED_B
+        // Consecutive invocations read consecutive columns of B (coalesced)
+        // and write consecutive LDS addresses (conflict free).
+        [[unroll]] for (uint idx = tid; idx < BK * BN; idx += NTHREADS) {
+            uint kk = idx / BN;
+            uint nn = idx - kk * BN;
+            Bs[kk][nn] = B[(kt + kk) * p.N + blockCol + nn];
+        }
+#endif
+
+#if USE_LDS
+        barrier();
+#endif
+
+        [[unroll]] for (uint kk = 0; kk < BK; ++kk) {
+            [[unroll]] for (int i = 0; i < TM; ++i) {
+#if USE_SHARED_A
+                regA[i] = As[kk][threadRow + i];
+#else
+                regA[i] = A[(gRow + i) * p.K + kt + kk];
+#endif
+            }
+            [[unroll]] for (int j = 0; j < TN; ++j) {
+#if USE_SHARED_B
+                regB[j] = Bs[kk][threadCol + j];
+#else
+                regB[j] = B[(kt + kk) * p.N + gCol + j];
+#endif
+            }
+            [[unroll]] for (int i = 0; i < TM; ++i)
+                [[unroll]] for (int j = 0; j < TN; ++j)
+                    acc[i][j] = fma(regA[i], regB[j], acc[i][j]);
+        }
+    }
+
+    [[unroll]] for (uint i = 0; i < TM; ++i)
+        [[unroll]] for (uint j = 0; j < TN; ++j)
+            C[(gRow + i) * p.N + gCol + j] = acc[i][j];
+}

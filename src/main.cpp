@@ -1,0 +1,980 @@
+// ---------------------------------------------------------------------------
+//  gemm_vk_bench - Vulkan compute SGEMM benchmark for Android (arm64-v8a)
+//
+//  Measures C[MxN] = A[MxK] * B[KxN] (fp32, row-major) with four kernel
+//  variants that differ ONLY in how the A/B operands are fed to the FMA loop:
+//
+//     none       A: global memory   B: global memory
+//     shared_a   A: shared memory   B: global memory
+//     shared_b   A: global memory   B: shared memory
+//     shared_ab  A: shared memory   B: shared memory
+//
+//  Two run modes:
+//     --mode perf   (default) pure performance, results are never read back
+//     --mode check  verify the GPU result against a CPU reference
+// ---------------------------------------------------------------------------
+
+#include <vulkan/vulkan.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdarg>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <functional>
+#include <random>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "gemm_none.h"
+#include "gemm_shared_a.h"
+#include "gemm_shared_b.h"
+#include "gemm_shared_ab.h"
+
+// Must match the shader's compile-time tiling constants.
+static const uint32_t kTileM = 64;  // BM = TS*TM
+static const uint32_t kTileN = 64;  // BN = TS*TN
+static const uint32_t kTileK = 16;  // BK
+
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+
+static void die(const char* fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    fprintf(stderr, "ERROR: ");
+    vfprintf(stderr, fmt, ap);
+    fprintf(stderr, "\n");
+    va_end(ap);
+    exit(1);
+}
+
+static const char* vkResultStr(VkResult r)
+{
+    switch (r) {
+    case VK_SUCCESS:                        return "VK_SUCCESS";
+    case VK_NOT_READY:                      return "VK_NOT_READY";
+    case VK_TIMEOUT:                        return "VK_TIMEOUT";
+    case VK_ERROR_OUT_OF_HOST_MEMORY:       return "VK_ERROR_OUT_OF_HOST_MEMORY";
+    case VK_ERROR_OUT_OF_DEVICE_MEMORY:     return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
+    case VK_ERROR_INITIALIZATION_FAILED:    return "VK_ERROR_INITIALIZATION_FAILED";
+    case VK_ERROR_DEVICE_LOST:              return "VK_ERROR_DEVICE_LOST";
+    case VK_ERROR_LAYER_NOT_PRESENT:        return "VK_ERROR_LAYER_NOT_PRESENT";
+    case VK_ERROR_EXTENSION_NOT_PRESENT:    return "VK_ERROR_EXTENSION_NOT_PRESENT";
+    case VK_ERROR_FEATURE_NOT_PRESENT:      return "VK_ERROR_FEATURE_NOT_PRESENT";
+    case VK_ERROR_INCOMPATIBLE_DRIVER:      return "VK_ERROR_INCOMPATIBLE_DRIVER";
+    case VK_ERROR_FRAGMENTED_POOL:          return "VK_ERROR_FRAGMENTED_POOL";
+    case VK_ERROR_OUT_OF_POOL_MEMORY:       return "VK_ERROR_OUT_OF_POOL_MEMORY";
+    default:                                return "VK_ERROR_<other>";
+    }
+}
+
+#define VK_CHECK(expr)                                                        \
+    do {                                                                      \
+        VkResult _r = (expr);                                                 \
+        if (_r != VK_SUCCESS)                                                 \
+            die("%s failed at %s:%d -> %s (%d)", #expr, __FILE__, __LINE__,   \
+                vkResultStr(_r), (int)_r);                                    \
+    } while (0)
+
+static double nowSeconds()
+{
+    using clock = std::chrono::steady_clock;
+    return std::chrono::duration<double>(clock::now().time_since_epoch()).count();
+}
+
+static double median(std::vector<double> v)
+{
+    if (v.empty()) return 0.0;
+    std::sort(v.begin(), v.end());
+    size_t n = v.size();
+    return (n & 1) ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
+}
+
+// ---------------------------------------------------------------------------
+// kernel table
+// ---------------------------------------------------------------------------
+
+struct KernelDesc {
+    const char*     name;
+    const char*     aSrc;
+    const char*     bSrc;
+    const uint32_t* spv;
+    size_t          spvBytes;
+};
+
+static const KernelDesc kKernels[] = {
+    { "none",      "global", "global", gemm_none_spv,      sizeof(gemm_none_spv)      },
+    { "shared_a",  "shared", "global", gemm_shared_a_spv,  sizeof(gemm_shared_a_spv)  },
+    { "shared_b",  "global", "shared", gemm_shared_b_spv,  sizeof(gemm_shared_b_spv)  },
+    { "shared_ab", "shared", "shared", gemm_shared_ab_spv, sizeof(gemm_shared_ab_spv) },
+};
+static const int kNumKernels = (int)(sizeof(kKernels) / sizeof(kKernels[0]));
+
+// ---------------------------------------------------------------------------
+// options
+// ---------------------------------------------------------------------------
+
+struct Options {
+    std::vector<uint32_t> sizes{ 2048, 4096 };
+    std::vector<int>      kernels{ 0, 1, 2, 3 };
+    int         iters       = 5;
+    int         warmup      = 2;
+    bool        check       = false;   // --mode check
+    bool        fullCheck   = false;   // full CPU reference instead of sampled
+    int         samples     = 4096;
+    int         deviceIndex = -1;
+    bool        validation  = false;
+    bool        listDevices = false;
+    uint32_t    seed        = 12345u;
+    std::string csvPath;
+};
+
+static void usage(const char* argv0)
+{
+    printf(
+"Vulkan GEMM benchmark (fp32, C = A*B) for Android GPUs\n"
+"\n"
+"Usage: %s [options]\n"
+"\n"
+"  --mode <perf|check>   perf  = timing only, results are not read back (default)\n"
+"                        check = verify GPU results against a CPU reference\n"
+"  --sizes <list>        comma separated square sizes, default 2048,4096\n"
+"  --iters <n>           timed iterations per kernel, default 5\n"
+"  --warmup <n>          untimed warmup iterations, default 2\n"
+"  --kernels <list>      subset of: none,shared_a,shared_b,shared_ab (default all)\n"
+"  --samples <n>         check mode: random output elements to verify (default 4096)\n"
+"  --full-check          check mode: verify every element with a CPU GEMM (slow)\n"
+"  --device <idx>        physical device index, default: first non-CPU device\n"
+"  --list-devices        print available Vulkan devices and exit\n"
+"  --validation          enable VK_LAYER_KHRONOS_validation\n"
+"  --seed <n>            RNG seed for the input matrices, default 12345\n"
+"  --csv <path>          also append the per-run results to a CSV file\n"
+"  -h, --help            this text\n"
+"\n"
+"Kernel variants (identical tiling, only the operand staging differs):\n"
+"  none       A global,  B global   - no shared memory at all\n"
+"  shared_a   A shared,  B global\n"
+"  shared_b   A global,  B shared\n"
+"  shared_ab  A shared,  B shared\n",
+        argv0);
+}
+
+static std::vector<std::string> splitList(const char* s)
+{
+    std::vector<std::string> out;
+    std::string cur;
+    for (const char* p = s; ; ++p) {
+        if (*p == ',' || *p == '\0') {
+            if (!cur.empty()) out.push_back(cur);
+            cur.clear();
+            if (*p == '\0') break;
+        } else {
+            cur.push_back(*p);
+        }
+    }
+    return out;
+}
+
+static Options parseArgs(int argc, char** argv)
+{
+    Options o;
+    auto need = [&](int i, const char* what) {
+        if (i + 1 >= argc) die("%s expects an argument", what);
+        return argv[i + 1];
+    };
+
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "-h" || a == "--help") { usage(argv[0]); exit(0); }
+        else if (a == "--mode") {
+            std::string m = need(i, "--mode"); ++i;
+            if (m == "perf")       o.check = false;
+            else if (m == "check") o.check = true;
+            else die("unknown mode '%s' (expected perf or check)", m.c_str());
+        }
+        else if (a == "--sizes") {
+            o.sizes.clear();
+            for (auto& s : splitList(need(i, "--sizes"))) o.sizes.push_back((uint32_t)strtoul(s.c_str(), nullptr, 10));
+            ++i;
+            if (o.sizes.empty()) die("--sizes list is empty");
+        }
+        else if (a == "--kernels") {
+            o.kernels.clear();
+            for (auto& s : splitList(need(i, "--kernels"))) {
+                int found = -1;
+                for (int k = 0; k < kNumKernels; ++k)
+                    if (s == kKernels[k].name) found = k;
+                if (found < 0) die("unknown kernel '%s'", s.c_str());
+                o.kernels.push_back(found);
+            }
+            ++i;
+            if (o.kernels.empty()) die("--kernels list is empty");
+        }
+        else if (a == "--iters")        { o.iters = atoi(need(i, "--iters")); ++i; }
+        else if (a == "--warmup")       { o.warmup = atoi(need(i, "--warmup")); ++i; }
+        else if (a == "--samples")      { o.samples = atoi(need(i, "--samples")); ++i; }
+        else if (a == "--full-check")   { o.fullCheck = true; o.check = true; }
+        else if (a == "--device")       { o.deviceIndex = atoi(need(i, "--device")); ++i; }
+        else if (a == "--list-devices") { o.listDevices = true; }
+        else if (a == "--validation")   { o.validation = true; }
+        else if (a == "--seed")         { o.seed = (uint32_t)strtoul(need(i, "--seed"), nullptr, 10); ++i; }
+        else if (a == "--csv")          { o.csvPath = need(i, "--csv"); ++i; }
+        else die("unknown option '%s' (try --help)", a.c_str());
+    }
+
+    if (o.iters  < 1) die("--iters must be >= 1");
+    if (o.warmup < 0) die("--warmup must be >= 0");
+    for (uint32_t s : o.sizes) {
+        if (s == 0) die("size must be > 0");
+        if (s % kTileM || s % kTileN || s % kTileK)
+            die("size %u must be a multiple of %u (M/N tile) and %u (K tile)", s, kTileM, kTileK);
+    }
+    return o;
+}
+
+// ---------------------------------------------------------------------------
+// Vulkan context
+// ---------------------------------------------------------------------------
+
+struct VulkanCtx {
+    VkInstance                       instance   = VK_NULL_HANDLE;
+    VkPhysicalDevice                 phys       = VK_NULL_HANDLE;
+    VkDevice                         device     = VK_NULL_HANDLE;
+    VkQueue                          queue      = VK_NULL_HANDLE;
+    uint32_t                         queueFamily = 0;
+    uint32_t                         timestampValidBits = 0;
+    VkPhysicalDeviceProperties       props{};
+    VkPhysicalDeviceMemoryProperties memProps{};
+    VkCommandPool                    cmdPool    = VK_NULL_HANDLE;
+    VkQueryPool                      queryPool  = VK_NULL_HANDLE;
+    std::string                      driverName;
+    std::string                      driverInfo;
+};
+
+static const char* devTypeStr(VkPhysicalDeviceType t)
+{
+    switch (t) {
+    case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU: return "integrated GPU";
+    case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:   return "discrete GPU";
+    case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:    return "virtual GPU";
+    case VK_PHYSICAL_DEVICE_TYPE_CPU:            return "CPU";
+    default:                                     return "other";
+    }
+}
+
+static void createInstance(VulkanCtx& ctx, const Options& o)
+{
+    VkApplicationInfo app{ VK_STRUCTURE_TYPE_APPLICATION_INFO };
+    app.pApplicationName = "gemm_vk_bench";
+    app.apiVersion       = VK_API_VERSION_1_1;
+
+    std::vector<const char*> layers;
+    if (o.validation) {
+        uint32_t n = 0;
+        vkEnumerateInstanceLayerProperties(&n, nullptr);
+        std::vector<VkLayerProperties> lp(n);
+        vkEnumerateInstanceLayerProperties(&n, lp.data());
+        bool have = false;
+        for (auto& l : lp)
+            if (!strcmp(l.layerName, "VK_LAYER_KHRONOS_validation")) have = true;
+        if (have) layers.push_back("VK_LAYER_KHRONOS_validation");
+        else fprintf(stderr, "WARNING: VK_LAYER_KHRONOS_validation not available, continuing without it\n");
+    }
+
+    VkInstanceCreateInfo ci{ VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO };
+    ci.pApplicationInfo        = &app;
+    ci.enabledLayerCount       = (uint32_t)layers.size();
+    ci.ppEnabledLayerNames     = layers.data();
+
+    VkResult r = vkCreateInstance(&ci, nullptr, &ctx.instance);
+    if (r == VK_ERROR_INCOMPATIBLE_DRIVER) {
+        // Fall back to a 1.0 instance on older loaders.
+        app.apiVersion = VK_API_VERSION_1_0;
+        r = vkCreateInstance(&ci, nullptr, &ctx.instance);
+    }
+    if (r != VK_SUCCESS) die("vkCreateInstance failed: %s", vkResultStr(r));
+}
+
+static void queryDriverInfo(VulkanCtx& ctx)
+{
+    if (ctx.props.apiVersion < VK_API_VERSION_1_1) return;
+    auto fp = (PFN_vkGetPhysicalDeviceProperties2)
+        vkGetInstanceProcAddr(ctx.instance, "vkGetPhysicalDeviceProperties2");
+    if (!fp) return;
+
+    VkPhysicalDeviceDriverProperties drv{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES };
+    VkPhysicalDeviceProperties2 p2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2 };
+    p2.pNext = &drv;
+    fp(ctx.phys, &p2);
+    ctx.driverName = drv.driverName;
+    ctx.driverInfo = drv.driverInfo;
+}
+
+static void pickDevice(VulkanCtx& ctx, const Options& o)
+{
+    uint32_t n = 0;
+    VK_CHECK(vkEnumeratePhysicalDevices(ctx.instance, &n, nullptr));
+    if (n == 0) die("no Vulkan physical device found");
+    std::vector<VkPhysicalDevice> devs(n);
+    VK_CHECK(vkEnumeratePhysicalDevices(ctx.instance, &n, devs.data()));
+
+    if (o.listDevices) {
+        printf("Vulkan physical devices (%u):\n", n);
+        for (uint32_t i = 0; i < n; ++i) {
+            VkPhysicalDeviceProperties p;
+            vkGetPhysicalDeviceProperties(devs[i], &p);
+            printf("  [%u] %-40s  %-15s  API %u.%u.%u\n", i, p.deviceName, devTypeStr(p.deviceType),
+                   VK_VERSION_MAJOR(p.apiVersion), VK_VERSION_MINOR(p.apiVersion), VK_VERSION_PATCH(p.apiVersion));
+        }
+        exit(0);
+    }
+
+    int pick = o.deviceIndex;
+    if (pick < 0) {
+        pick = 0;
+        for (uint32_t i = 0; i < n; ++i) {
+            VkPhysicalDeviceProperties p;
+            vkGetPhysicalDeviceProperties(devs[i], &p);
+            if (p.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU) { pick = (int)i; break; }
+        }
+    }
+    if (pick >= (int)n) die("--device %d out of range (%u devices)", pick, n);
+
+    ctx.phys = devs[pick];
+    vkGetPhysicalDeviceProperties(ctx.phys, &ctx.props);
+    vkGetPhysicalDeviceMemoryProperties(ctx.phys, &ctx.memProps);
+    queryDriverInfo(ctx);
+}
+
+static void createDevice(VulkanCtx& ctx)
+{
+    uint32_t n = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(ctx.phys, &n, nullptr);
+    std::vector<VkQueueFamilyProperties> qf(n);
+    vkGetPhysicalDeviceQueueFamilyProperties(ctx.phys, &n, qf.data());
+
+    // Prefer a compute-only family (async compute); fall back to any compute queue.
+    int chosen = -1;
+    for (uint32_t i = 0; i < n; ++i)
+        if ((qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && !(qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) { chosen = (int)i; break; }
+    if (chosen < 0)
+        for (uint32_t i = 0; i < n; ++i)
+            if (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) { chosen = (int)i; break; }
+    if (chosen < 0) die("no compute-capable queue family");
+
+    ctx.queueFamily        = (uint32_t)chosen;
+    ctx.timestampValidBits = qf[chosen].timestampValidBits;
+
+    float prio = 1.0f;
+    VkDeviceQueueCreateInfo qci{ VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
+    qci.queueFamilyIndex = ctx.queueFamily;
+    qci.queueCount       = 1;
+    qci.pQueuePriorities = &prio;
+
+    VkDeviceCreateInfo dci{ VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
+    dci.queueCreateInfoCount = 1;
+    dci.pQueueCreateInfos    = &qci;
+
+    VK_CHECK(vkCreateDevice(ctx.phys, &dci, nullptr, &ctx.device));
+    vkGetDeviceQueue(ctx.device, ctx.queueFamily, 0, &ctx.queue);
+
+    VkCommandPoolCreateInfo cpi{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+    cpi.flags            = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    cpi.queueFamilyIndex = ctx.queueFamily;
+    VK_CHECK(vkCreateCommandPool(ctx.device, &cpi, nullptr, &ctx.cmdPool));
+
+    if (ctx.timestampValidBits > 0) {
+        VkQueryPoolCreateInfo qpi{ VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO };
+        qpi.queryType  = VK_QUERY_TYPE_TIMESTAMP;
+        qpi.queryCount = 2;
+        VK_CHECK(vkCreateQueryPool(ctx.device, &qpi, nullptr, &ctx.queryPool));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// buffers
+// ---------------------------------------------------------------------------
+
+struct Buffer {
+    VkBuffer       buf  = VK_NULL_HANDLE;
+    VkDeviceMemory mem  = VK_NULL_HANDLE;
+    VkDeviceSize   size = 0;
+    void*          host = nullptr;
+};
+
+static uint32_t findMemoryType(const VulkanCtx& ctx, uint32_t typeBits, VkMemoryPropertyFlags want)
+{
+    for (uint32_t i = 0; i < ctx.memProps.memoryTypeCount; ++i)
+        if ((typeBits & (1u << i)) && (ctx.memProps.memoryTypes[i].propertyFlags & want) == want)
+            return i;
+    return UINT32_MAX;
+}
+
+static Buffer createBuffer(const VulkanCtx& ctx, VkDeviceSize size,
+                           VkBufferUsageFlags usage, VkMemoryPropertyFlags want,
+                           const char* what)
+{
+    Buffer b;
+    b.size = size;
+
+    VkBufferCreateInfo bi{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    bi.size        = size;
+    bi.usage       = usage;
+    bi.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VK_CHECK(vkCreateBuffer(ctx.device, &bi, nullptr, &b.buf));
+
+    VkMemoryRequirements req;
+    vkGetBufferMemoryRequirements(ctx.device, b.buf, &req);
+
+    uint32_t type = findMemoryType(ctx, req.memoryTypeBits, want);
+    if (type == UINT32_MAX && (want & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+        // Unified-memory parts may not expose a plain DEVICE_LOCAL type.
+        type = findMemoryType(ctx, req.memoryTypeBits, 0);
+    }
+    if (type == UINT32_MAX) die("no suitable memory type for %s (%.1f MiB)", what, size / 1048576.0);
+
+    VkMemoryAllocateInfo ai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO };
+    ai.allocationSize  = req.size;
+    ai.memoryTypeIndex = type;
+    VkResult r = vkAllocateMemory(ctx.device, &ai, nullptr, &b.mem);
+    if (r != VK_SUCCESS)
+        die("failed to allocate %.1f MiB for %s: %s", size / 1048576.0, what, vkResultStr(r));
+
+    VK_CHECK(vkBindBufferMemory(ctx.device, b.buf, b.mem, 0));
+
+    if (ctx.memProps.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+        VK_CHECK(vkMapMemory(ctx.device, b.mem, 0, VK_WHOLE_SIZE, 0, &b.host));
+
+    return b;
+}
+
+static void destroyBuffer(const VulkanCtx& ctx, Buffer& b)
+{
+    if (b.host) { vkUnmapMemory(ctx.device, b.mem); b.host = nullptr; }
+    if (b.buf)  { vkDestroyBuffer(ctx.device, b.buf, nullptr); b.buf = VK_NULL_HANDLE; }
+    if (b.mem)  { vkFreeMemory(ctx.device, b.mem, nullptr);    b.mem = VK_NULL_HANDLE; }
+}
+
+// One-shot command buffer helper: record, submit, wait, free.
+static void submitOnce(const VulkanCtx& ctx, const std::function<void(VkCommandBuffer)>& rec)
+{
+    VkCommandBufferAllocateInfo ai{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+    ai.commandPool        = ctx.cmdPool;
+    ai.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    ai.commandBufferCount = 1;
+    VkCommandBuffer cb;
+    VK_CHECK(vkAllocateCommandBuffers(ctx.device, &ai, &cb));
+
+    VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VK_CHECK(vkBeginCommandBuffer(cb, &bi));
+    rec(cb);
+    VK_CHECK(vkEndCommandBuffer(cb));
+
+    VkFenceCreateInfo fi{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+    VkFence fence;
+    VK_CHECK(vkCreateFence(ctx.device, &fi, nullptr, &fence));
+
+    VkSubmitInfo si{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+    si.commandBufferCount = 1;
+    si.pCommandBuffers    = &cb;
+    VK_CHECK(vkQueueSubmit(ctx.queue, 1, &si, fence));
+    VK_CHECK(vkWaitForFences(ctx.device, 1, &fence, VK_TRUE, UINT64_MAX));
+
+    vkDestroyFence(ctx.device, fence, nullptr);
+    vkFreeCommandBuffers(ctx.device, ctx.cmdPool, 1, &cb);
+}
+
+// ---------------------------------------------------------------------------
+// CPU reference
+// ---------------------------------------------------------------------------
+
+// Exact dot product for a single output element, accumulated in double.
+static double refElement(const float* A, const float* B, uint32_t row, uint32_t col,
+                         uint32_t N, uint32_t K)
+{
+    const float* a = A + (size_t)row * K;
+    const float* b = B + col;
+    double s = 0.0;
+    for (uint32_t k = 0; k < K; ++k)
+        s += (double)a[k] * (double)b[(size_t)k * N];
+    return s;
+}
+
+struct CheckResult {
+    double   maxAbs   = 0.0;
+    double   maxRel   = 0.0;
+    double   rms      = 0.0;
+    uint64_t compared = 0;
+    uint64_t bad      = 0;
+    bool     pass     = true;
+};
+
+static void accumulateError(CheckResult& cr, double got, double ref, double atol, double rtol)
+{
+    double d = std::fabs(got - ref);
+    double rel = d / std::max(std::fabs(ref), 1e-30);
+    cr.maxAbs = std::max(cr.maxAbs, d);
+    if (std::fabs(ref) > 1e-6) cr.maxRel = std::max(cr.maxRel, rel);
+    cr.rms += d * d;
+    cr.compared++;
+    if (d > atol + rtol * std::fabs(ref)) { cr.bad++; cr.pass = false; }
+}
+
+static CheckResult checkSampled(const float* A, const float* B, const float* C,
+                                uint32_t M, uint32_t N, uint32_t K,
+                                int samples, uint32_t seed, double atol, double rtol)
+{
+    CheckResult cr;
+    std::mt19937 rng(seed ^ 0xB1A5u);
+    std::uniform_int_distribution<uint32_t> dr(0, M - 1), dc(0, N - 1);
+
+    // Always include the four corners; they catch indexing bugs at the edges.
+    std::vector<std::pair<uint32_t, uint32_t>> pts = {
+        { 0, 0 }, { 0, N - 1 }, { M - 1, 0 }, { M - 1, N - 1 }
+    };
+    for (int i = 0; i < samples; ++i) pts.push_back({ dr(rng), dc(rng) });
+
+    for (auto& p : pts) {
+        double ref = refElement(A, B, p.first, p.second, N, K);
+        double got = (double)C[(size_t)p.first * N + p.second];
+        accumulateError(cr, got, ref, atol, rtol);
+    }
+    cr.rms = std::sqrt(cr.rms / (double)cr.compared);
+    return cr;
+}
+
+static CheckResult checkFull(const float* A, const float* B, const float* C,
+                             uint32_t M, uint32_t N, uint32_t K, double atol, double rtol)
+{
+    unsigned nt = std::max(1u, std::thread::hardware_concurrency());
+    std::vector<CheckResult> parts(nt);
+    std::vector<std::thread>  th;
+
+    for (unsigned t = 0; t < nt; ++t) {
+        th.emplace_back([&, t]() {
+            std::vector<double> row(N);
+            for (uint32_t m = t; m < M; m += nt) {
+                std::fill(row.begin(), row.end(), 0.0);
+                const float* a = A + (size_t)m * K;
+                for (uint32_t k = 0; k < K; ++k) {           // i-k-j: cache friendly
+                    double av = a[k];
+                    if (av == 0.0) continue;
+                    const float* b = B + (size_t)k * N;
+                    for (uint32_t n = 0; n < N; ++n) row[n] += av * b[n];
+                }
+                const float* c = C + (size_t)m * N;
+                for (uint32_t n = 0; n < N; ++n)
+                    accumulateError(parts[t], (double)c[n], row[n], atol, rtol);
+            }
+        });
+    }
+    for (auto& x : th) x.join();
+
+    CheckResult cr;
+    for (auto& p : parts) {
+        cr.maxAbs = std::max(cr.maxAbs, p.maxAbs);
+        cr.maxRel = std::max(cr.maxRel, p.maxRel);
+        cr.rms   += p.rms;
+        cr.compared += p.compared;
+        cr.bad      += p.bad;
+        cr.pass      = cr.pass && p.pass;
+    }
+    cr.rms = std::sqrt(cr.rms / (double)std::max<uint64_t>(cr.compared, 1));
+    return cr;
+}
+
+// ---------------------------------------------------------------------------
+// benchmark
+// ---------------------------------------------------------------------------
+
+struct RunStats {
+    int                 kernel = 0;
+    std::vector<double> gpuMs;      // from GPU timestamps (empty if unsupported)
+    std::vector<double> wallMs;     // submit -> fence signalled
+    bool                checked = false;
+    CheckResult         check;
+    bool                bitExactVsFirst = false;
+    double              maxDiffVsFirst  = 0.0;
+};
+
+int main(int argc, char** argv)
+{
+    Options o = parseArgs(argc, argv);
+
+    VulkanCtx ctx;
+    createInstance(ctx, o);
+    pickDevice(ctx, o);
+    createDevice(ctx);
+
+    const double tsPeriodNs = ctx.props.limits.timestampPeriod;
+    const bool   haveTs     = (ctx.queryPool != VK_NULL_HANDLE) && tsPeriodNs > 0.0;
+
+    printf("======================================================================\n");
+    printf(" Vulkan GEMM benchmark  (fp32, C[MxN] = A[MxK] * B[KxN], row-major)\n");
+    printf("======================================================================\n");
+    printf("  Device            : %s\n", ctx.props.deviceName);
+    printf("  Type              : %s\n", devTypeStr(ctx.props.deviceType));
+    printf("  Vulkan API        : %u.%u.%u\n", VK_VERSION_MAJOR(ctx.props.apiVersion),
+           VK_VERSION_MINOR(ctx.props.apiVersion), VK_VERSION_PATCH(ctx.props.apiVersion));
+    if (!ctx.driverName.empty())
+        printf("  Driver            : %s / %s\n", ctx.driverName.c_str(), ctx.driverInfo.c_str());
+    printf("  Vendor/Device ID  : 0x%04x / 0x%04x\n", ctx.props.vendorID, ctx.props.deviceID);
+    printf("  Max shared mem/WG : %u bytes\n", ctx.props.limits.maxComputeSharedMemorySize);
+    printf("  Max WG invocations: %u\n", ctx.props.limits.maxComputeWorkGroupInvocations);
+    if (haveTs)
+        printf("  GPU timestamps    : yes (period %.3f ns, %u valid bits)\n", tsPeriodNs, ctx.timestampValidBits);
+    else
+        printf("  GPU timestamps    : NOT supported - falling back to wall-clock timing\n");
+    printf("  Tiling            : block %ux%u, K-tile %u, workgroup 16x16, 4x4 per invocation\n",
+           kTileM, kTileN, kTileK);
+    printf("  Mode              : %s\n",
+           o.check ? (o.fullCheck ? "CHECK (full CPU reference)" : "CHECK (sampled CPU reference)")
+                   : "PERF (results are not verified)");
+    printf("  Iterations        : %d timed + %d warmup\n", o.iters, o.warmup);
+    printf("  Seed              : %u\n", o.seed);
+    printf("\n");
+
+    {   // sanity: the shared_ab variant needs the most LDS
+        uint32_t lds = kTileK * (kTileM + 4) * 4 + kTileK * kTileN * 4;
+        if (lds > ctx.props.limits.maxComputeSharedMemorySize)
+            die("kernel needs %u bytes of shared memory, device allows %u",
+                lds, ctx.props.limits.maxComputeSharedMemorySize);
+        if (256 > ctx.props.limits.maxComputeWorkGroupInvocations)
+            die("kernel uses 256 invocations per workgroup, device allows %u",
+                ctx.props.limits.maxComputeWorkGroupInvocations);
+    }
+
+    // ---- shared pipeline objects -----------------------------------------
+    VkDescriptorSetLayoutBinding binds[3]{};
+    for (int i = 0; i < 3; ++i) {
+        binds[i].binding         = (uint32_t)i;
+        binds[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        binds[i].descriptorCount = 1;
+        binds[i].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+    }
+    VkDescriptorSetLayoutCreateInfo dli{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO };
+    dli.bindingCount = 3;
+    dli.pBindings    = binds;
+    VkDescriptorSetLayout setLayout;
+    VK_CHECK(vkCreateDescriptorSetLayout(ctx.device, &dli, nullptr, &setLayout));
+
+    VkPushConstantRange pcr{ VK_SHADER_STAGE_COMPUTE_BIT, 0, 3 * sizeof(uint32_t) };
+    VkPipelineLayoutCreateInfo pli{ VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO };
+    pli.setLayoutCount         = 1;
+    pli.pSetLayouts            = &setLayout;
+    pli.pushConstantRangeCount = 1;
+    pli.pPushConstantRanges    = &pcr;
+    VkPipelineLayout pipeLayout;
+    VK_CHECK(vkCreatePipelineLayout(ctx.device, &pli, nullptr, &pipeLayout));
+
+    VkPipeline pipelines[kNumKernels]{};
+    for (int k = 0; k < kNumKernels; ++k) {
+        VkShaderModuleCreateInfo smi{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+        smi.codeSize = kKernels[k].spvBytes;
+        smi.pCode    = kKernels[k].spv;
+        VkShaderModule mod;
+        VK_CHECK(vkCreateShaderModule(ctx.device, &smi, nullptr, &mod));
+
+        VkComputePipelineCreateInfo cpi{ VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
+        cpi.stage.sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        cpi.stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+        cpi.stage.module = mod;
+        cpi.stage.pName  = "main";
+        cpi.layout       = pipeLayout;
+        VK_CHECK(vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &cpi, nullptr, &pipelines[k]));
+        vkDestroyShaderModule(ctx.device, mod, nullptr);
+    }
+
+    VkDescriptorPoolSize psz{ VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 3 };
+    VkDescriptorPoolCreateInfo dpi{ VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO };
+    dpi.flags         = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+    dpi.maxSets       = 1;
+    dpi.poolSizeCount = 1;
+    dpi.pPoolSizes    = &psz;
+    VkDescriptorPool descPool;
+    VK_CHECK(vkCreateDescriptorPool(ctx.device, &dpi, nullptr, &descPool));
+
+    FILE* csv = nullptr;
+    if (!o.csvPath.empty()) {
+        csv = fopen(o.csvPath.c_str(), "w");
+        if (!csv) die("cannot open CSV file '%s'", o.csvPath.c_str());
+        fprintf(csv, "device,size,kernel,a_source,b_source,run,gpu_ms,wall_ms,gflop,tflops\n");
+    }
+
+    // ---- per size ---------------------------------------------------------
+    for (uint32_t S : o.sizes) {
+        const uint32_t M = S, N = S, K = S;
+        const size_t   elems = (size_t)M * N;
+        const VkDeviceSize bytes = (VkDeviceSize)elems * sizeof(float);
+        const double   gflop = 2.0 * (double)M * (double)N * (double)K / 1e9;
+
+        printf("======================================================================\n");
+        printf(" M = N = K = %u      2*M*N*K = %.3f GFLOP      %.1f MiB per matrix\n",
+               S, gflop, bytes / 1048576.0);
+        printf("======================================================================\n");
+        fflush(stdout);
+
+        Buffer bufA = createBuffer(ctx, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, "matrix A");
+        Buffer bufB = createBuffer(ctx, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, "matrix B");
+        Buffer bufC = createBuffer(ctx, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT
+                                             | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, "matrix C");
+        Buffer staging = createBuffer(ctx, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                                      "staging");
+
+        // Host copies of A and B are only needed when we verify.
+        std::vector<float> hostA, hostB, hostC, refC;
+        std::mt19937 rng(o.seed);
+        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+
+        auto uploadInto = [&](Buffer& dst, std::vector<float>* keep) {
+            float* p = (float*)staging.host;
+            for (size_t i = 0; i < elems; ++i) p[i] = dist(rng);
+            if (keep) keep->assign(p, p + elems);
+            submitOnce(ctx, [&](VkCommandBuffer cb) {
+                VkBufferCopy c{ 0, 0, bytes };
+                vkCmdCopyBuffer(cb, staging.buf, dst.buf, 1, &c);
+            });
+        };
+        uploadInto(bufA, o.check ? &hostA : nullptr);
+        uploadInto(bufB, o.check ? &hostB : nullptr);
+
+        VkDescriptorSetAllocateInfo dsa{ VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO };
+        dsa.descriptorPool     = descPool;
+        dsa.descriptorSetCount = 1;
+        dsa.pSetLayouts        = &setLayout;
+        VkDescriptorSet dset;
+        VK_CHECK(vkAllocateDescriptorSets(ctx.device, &dsa, &dset));
+
+        VkDescriptorBufferInfo dbi[3] = {
+            { bufA.buf, 0, VK_WHOLE_SIZE },
+            { bufB.buf, 0, VK_WHOLE_SIZE },
+            { bufC.buf, 0, VK_WHOLE_SIZE },
+        };
+        VkWriteDescriptorSet w[3]{};
+        for (int i = 0; i < 3; ++i) {
+            w[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w[i].dstSet          = dset;
+            w[i].dstBinding      = (uint32_t)i;
+            w[i].descriptorCount = 1;
+            w[i].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            w[i].pBufferInfo     = &dbi[i];
+        }
+        vkUpdateDescriptorSets(ctx.device, 3, w, 0, nullptr);
+
+        // One reusable command buffer holding exactly one dispatch.
+        VkCommandBufferAllocateInfo cba{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+        cba.commandPool        = ctx.cmdPool;
+        cba.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cba.commandBufferCount = 1;
+        VkCommandBuffer cb;
+        VK_CHECK(vkAllocateCommandBuffers(ctx.device, &cba, &cb));
+
+        VkFenceCreateInfo fci{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+        VkFence fence;
+        VK_CHECK(vkCreateFence(ctx.device, &fci, nullptr, &fence));
+
+        const uint32_t pc[3] = { M, N, K };
+        const uint32_t gx = N / kTileN, gy = M / kTileM;
+
+        std::vector<RunStats> stats;
+
+        for (size_t ki = 0; ki < o.kernels.size(); ++ki) {
+            const int kidx = o.kernels[ki];
+            const KernelDesc& kd = kKernels[kidx];
+
+            // Record once, submit many times.
+            VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
+            VK_CHECK(vkResetCommandBuffer(cb, 0));
+            VK_CHECK(vkBeginCommandBuffer(cb, &bi));
+            if (haveTs) {
+                vkCmdResetQueryPool(cb, ctx.queryPool, 0, 2);
+                vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, ctx.queryPool, 0);
+            }
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipelines[kidx]);
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeLayout, 0, 1, &dset, 0, nullptr);
+            vkCmdPushConstants(cb, pipeLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
+            vkCmdDispatch(cb, gx, gy, 1);
+            if (haveTs)
+                vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, ctx.queryPool, 1);
+            VK_CHECK(vkEndCommandBuffer(cb));
+
+            auto runOnce = [&](double* gpuMs, double* wallMs) {
+                VK_CHECK(vkResetFences(ctx.device, 1, &fence));
+                VkSubmitInfo si{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+                si.commandBufferCount = 1;
+                si.pCommandBuffers    = &cb;
+                double t0 = nowSeconds();
+                VK_CHECK(vkQueueSubmit(ctx.queue, 1, &si, fence));
+                VK_CHECK(vkWaitForFences(ctx.device, 1, &fence, VK_TRUE, UINT64_MAX));
+                double t1 = nowSeconds();
+                if (wallMs) *wallMs = (t1 - t0) * 1e3;
+                if (gpuMs && haveTs) {
+                    uint64_t ts[2] = { 0, 0 };
+                    VkResult r = vkGetQueryPoolResults(ctx.device, ctx.queryPool, 0, 2, sizeof(ts), ts,
+                                                       sizeof(uint64_t),
+                                                       VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+                    if (r == VK_SUCCESS) {
+                        uint64_t mask = (ctx.timestampValidBits >= 64) ? ~0ull
+                                                                       : ((1ull << ctx.timestampValidBits) - 1ull);
+                        uint64_t d = (ts[1] & mask) - (ts[0] & mask);
+                        *gpuMs = (double)d * tsPeriodNs / 1e6;
+                    } else {
+                        *gpuMs = -1.0;
+                    }
+                }
+            };
+
+            printf("[%-9s]  A:%s  B:%s\n", kd.name, kd.aSrc, kd.bSrc);
+
+            for (int w2 = 0; w2 < o.warmup; ++w2) runOnce(nullptr, nullptr);
+
+            RunStats rs;
+            rs.kernel = kidx;
+            for (int it = 0; it < o.iters; ++it) {
+                double g = -1.0, wm = 0.0;
+                runOnce(&g, &wm);
+                double t = (g > 0.0) ? g : wm;
+                if (g > 0.0) rs.gpuMs.push_back(g);
+                rs.wallMs.push_back(wm);
+                char gpuStr[24];
+                if (g > 0.0) snprintf(gpuStr, sizeof(gpuStr), "%9.3f", g);
+                else         snprintf(gpuStr, sizeof(gpuStr), "%9s", "n/a");
+                printf("    run %d/%d   gpu %s ms   wall %9.3f ms   %8.4f TFLOPS\n",
+                       it + 1, o.iters, gpuStr, wm, gflop / t / 1e3);
+                fflush(stdout);
+                if (csv)
+                    fprintf(csv, "%s,%u,%s,%s,%s,%d,%.6f,%.6f,%.3f,%.6f\n",
+                            ctx.props.deviceName, S, kd.name, kd.aSrc, kd.bSrc, it + 1,
+                            g, wm, gflop, gflop / t / 1e3);
+            }
+
+            // ---- verification ------------------------------------------------
+            if (o.check) {
+                hostC.resize(elems);
+                submitOnce(ctx, [&](VkCommandBuffer c) {
+                    VkBufferMemoryBarrier bm{ VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER };
+                    bm.srcAccessMask       = VK_ACCESS_SHADER_WRITE_BIT;
+                    bm.dstAccessMask       = VK_ACCESS_TRANSFER_READ_BIT;
+                    bm.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    bm.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    bm.buffer              = bufC.buf;
+                    bm.size                = VK_WHOLE_SIZE;
+                    vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                         0, 0, nullptr, 1, &bm, 0, nullptr);
+                    VkBufferCopy cp{ 0, 0, bytes };
+                    vkCmdCopyBuffer(c, bufC.buf, staging.buf, 1, &cp);
+                });
+                memcpy(hostC.data(), staging.host, (size_t)bytes);
+
+                // fp32 dot product of length K, |a|,|b| <= 1 -> error grows ~ sqrt(K)*eps.
+                const double atol = 1e-2, rtol = 1e-4;
+                double t0 = nowSeconds();
+                rs.check = o.fullCheck
+                         ? checkFull(hostA.data(), hostB.data(), hostC.data(), M, N, K, atol, rtol)
+                         : checkSampled(hostA.data(), hostB.data(), hostC.data(), M, N, K,
+                                        o.samples, o.seed, atol, rtol);
+                double t1 = nowSeconds();
+                rs.checked = true;
+
+                printf("    verify   %s   compared %llu elems in %.2f s | max_abs %.3e  max_rel %.3e  rms %.3e",
+                       rs.check.pass ? "PASS" : "*** FAIL ***",
+                       (unsigned long long)rs.check.compared, t1 - t0,
+                       rs.check.maxAbs, rs.check.maxRel, rs.check.rms);
+                if (!rs.check.pass) printf("  (%llu bad)", (unsigned long long)rs.check.bad);
+                printf("\n");
+
+                // All four kernels accumulate in the same order, so they should
+                // agree bit-for-bit. Comparing them catches races the sampled
+                // CPU reference could miss.
+                if (refC.empty()) {
+                    refC = hostC;
+                } else {
+                    double mx = 0.0;
+                    bool exact = true;
+                    for (size_t i = 0; i < elems; ++i) {
+                        if (refC[i] != hostC[i]) exact = false;
+                        mx = std::max(mx, (double)std::fabs(refC[i] - hostC[i]));
+                    }
+                    rs.bitExactVsFirst = exact;
+                    rs.maxDiffVsFirst  = mx;
+                    printf("    vs %-9s %s   max_diff %.3e\n",
+                           kKernels[o.kernels[0]].name,
+                           exact ? "bit-exact" : "differs  ", mx);
+                }
+                fflush(stdout);
+            }
+
+            stats.push_back(rs);
+            printf("\n");
+        }
+
+        // ---- summary ------------------------------------------------------
+        printf("---------------------------------------------------------------------------------------\n");
+        printf(" summary  M=N=K=%u   (%.3f GFLOP per GEMM, %d runs)\n", S, gflop, o.iters);
+        printf("---------------------------------------------------------------------------------------\n");
+        printf(" %-10s %-16s %9s %9s %9s %10s %10s %8s\n",
+               "kernel", "A / B", "best_ms", "med_ms", "avg_ms", "TFLOPS_bst", "TFLOPS_avg", "vs base");
+        printf("---------------------------------------------------------------------------------------\n");
+
+        double baseBest = 0.0;
+        for (size_t i = 0; i < stats.size(); ++i) {
+            const RunStats& rs = stats[i];
+            const KernelDesc& kd = kKernels[rs.kernel];
+            const std::vector<double>& t = rs.gpuMs.empty() ? rs.wallMs : rs.gpuMs;
+            double best = *std::min_element(t.begin(), t.end());
+            double med  = median(t);
+            double avg  = 0.0;
+            for (double x : t) avg += x;
+            avg /= (double)t.size();
+            if (i == 0) baseBest = best;
+
+            char ab[32];
+            snprintf(ab, sizeof(ab), "%s / %s", kd.aSrc, kd.bSrc);
+            printf(" %-10s %-16s %9.3f %9.3f %9.3f %10.4f %10.4f %7.2fx\n",
+                   kd.name, ab, best, med, avg,
+                   gflop / best / 1e3, gflop / avg / 1e3, baseBest / best);
+        }
+        printf("---------------------------------------------------------------------------------------\n");
+        printf(" timing source: %s\n", haveTs ? "GPU timestamps" : "wall clock (submit->fence)");
+        if (o.check) {
+            printf(" verification : ");
+            bool allPass = true;
+            for (const RunStats& rs : stats) allPass = allPass && (!rs.checked || rs.check.pass);
+            printf("%s\n", allPass ? "ALL KERNELS PASS" : "*** SOME KERNELS FAILED ***");
+        }
+        printf("\n");
+        fflush(stdout);
+
+        vkDestroyFence(ctx.device, fence, nullptr);
+        vkFreeCommandBuffers(ctx.device, ctx.cmdPool, 1, &cb);
+        VK_CHECK(vkFreeDescriptorSets(ctx.device, descPool, 1, &dset));
+        destroyBuffer(ctx, staging);
+        destroyBuffer(ctx, bufC);
+        destroyBuffer(ctx, bufB);
+        destroyBuffer(ctx, bufA);
+    }
+
+    if (csv) fclose(csv);
+
+    for (int k = 0; k < kNumKernels; ++k) vkDestroyPipeline(ctx.device, pipelines[k], nullptr);
+    vkDestroyDescriptorPool(ctx.device, descPool, nullptr);
+    vkDestroyPipelineLayout(ctx.device, pipeLayout, nullptr);
+    vkDestroyDescriptorSetLayout(ctx.device, setLayout, nullptr);
+    if (ctx.queryPool) vkDestroyQueryPool(ctx.device, ctx.queryPool, nullptr);
+    vkDestroyCommandPool(ctx.device, ctx.cmdPool, nullptr);
+    vkDestroyDevice(ctx.device, nullptr);
+    vkDestroyInstance(ctx.instance, nullptr);
+    return 0;
+}
