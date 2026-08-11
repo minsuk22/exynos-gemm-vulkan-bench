@@ -99,6 +99,19 @@ static double nowSeconds()
     return std::chrono::duration<double>(clock::now().time_since_epoch()).count();
 }
 
+// GFLOP per millisecond IS TFLOP/s: 1e9 FLOP / 1e-3 s = 1e12 FLOP/s.
+// Kept as one function because open-coding it is what let an extra /1e3 spread
+// to five call sites and report every result 1000x low.
+static constexpr double tflops(double gflop, double ms)
+{
+    return (ms > 0.0) ? gflop / ms : 0.0;
+}
+
+// 2048^3 GEMM is 17.179869184 GFLOP; at 20 ms that is 0.859 TFLOP/s.
+static_assert(tflops(17.179869184, 20.0) > 0.8589 &&
+              tflops(17.179869184, 20.0) < 0.8591,
+              "TFLOPS unit conversion is wrong: GFLOP/ms already equals TFLOP/s");
+
 static double median(std::vector<double> v)
 {
     if (v.empty()) return 0.0;
@@ -923,12 +936,12 @@ int main(int argc, char** argv)
                 if (g > 0.0) snprintf(gpuStr, sizeof(gpuStr), "%9.3f", g);
                 else         snprintf(gpuStr, sizeof(gpuStr), "%9s", "n/a");
                 printf("    run %d/%d   gpu %s ms   wall %9.3f ms   %8.4f TFLOPS\n",
-                       it + 1, o.iters, gpuStr, wm, gflop / t / 1e3);
+                       it + 1, o.iters, gpuStr, wm, tflops(gflop, t));
                 fflush(stdout);
                 if (csv)
                     fprintf(csv, "%s,%u,%s,%s,%s,%d,%.6f,%.6f,%.3f,%.6f\n",
                             ctx.props.deviceName, S, kd.name, kd.aSrc, kd.bSrc, it + 1,
-                            g, wm, gflop, gflop / t / 1e3);
+                            g, wm, gflop, tflops(gflop, t));
             }
 
             // ---- verification ------------------------------------------------
@@ -1020,7 +1033,7 @@ int main(int argc, char** argv)
             snprintf(ab, sizeof(ab), "%s / %s", kd.aSrc, kd.bSrc);
             printf(" %-10s %-16s %9.3f %9.3f %9.3f %10.4f %10.4f %9.4f %7.2fx\n",
                    kd.name, ab, best, med, avg,
-                   gflop / best / 1e3, gflop / avg / 1e3, gflop / wallBest / 1e3,
+                   tflops(gflop, best), tflops(gflop, avg), tflops(gflop, wallBest),
                    baseBest / best);
         }
         printf("---------------------------------------------------------------------------------------\n");

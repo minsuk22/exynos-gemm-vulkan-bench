@@ -50,9 +50,11 @@ if ($LASTEXITCODE -ne 0) { throw "cmake build failed" }
 
 # Name carries the version (set via OUTPUT_NAME in CMakeLists.txt). Note the
 # version suffix makes PowerShell see ".2" as an extension, so match on name.
+# Sort by write time, not size: an older version left in the build dir must not
+# win just because it happened to link larger.
 $bin = Get-ChildItem $buildDir -Filter "gemm_vk_bench-v*" -File |
        Where-Object { $_.Name -notmatch '\.(pdb|ilk|map|cmake|txt)$' } |
-       Sort-Object Length -Descending | Select-Object -First 1
+       Sort-Object LastWriteTime -Descending | Select-Object -First 1
 if (-not $bin) { throw "built binary not found in $buildDir" }
 
 $name    = "$($bin.Name)-android-$Abi"

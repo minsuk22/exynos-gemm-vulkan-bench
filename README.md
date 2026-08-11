@@ -161,7 +161,10 @@ first kernel in the list.
 ```
 
 FLOP count is the standard `2*M*N*K`: 17.180 GFLOP at 2048, 137.439 GFLOP at
-4096. Timing comes from GPU timestamp queries (`VK_QUERY_TYPE_TIMESTAMP`,
+4096. Note that GFLOP divided by milliseconds is already TFLOP/s
+(`1e9 FLOP / 1e-3 s = 1e12 FLOP/s`) — the conversion lives in one `constexpr`
+guarded by a `static_assert`, because an extra `/1e3` open-coded at five call
+sites once reported every result 1000x low. Timing comes from GPU timestamp queries (`VK_QUERY_TYPE_TIMESTAMP`,
 scaled by `timestampPeriod`) when the queue family supports them, falling back
 to wall-clock around submit→fence otherwise; the summary states which was used.
 
