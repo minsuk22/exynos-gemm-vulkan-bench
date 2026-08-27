@@ -4,6 +4,9 @@ Android arm64 command-line binary that measures fp32 `C[MxN] = A[MxK] * B[KxN]`
 on a Vulkan compute queue, comparing four kernel variants that differ **only**
 in whether the A / B operand is staged through workgroup shared memory (LDS).
 
+**[Quick start](#quick-start)** if you just want the prebuilt binary on a phone
+— four commands, no NDK. What comes first is what it measures and why.
+
 | kernel      | A operand | B operand | LDS used |
 |-------------|-----------|-----------|----------|
 | `none`      | global    | global    | 0 B      |
@@ -116,22 +119,42 @@ Because the FMA order is identical everywhere, all four kernels should produce
 
 ---
 
-## Download
+## Quick start
 
-A prebuilt arm64-v8a binary is attached to the
-[latest release](https://github.com/minsuk22/exynos-gemm-vulkan-bench/releases/latest)
-if you don't want to set up the NDK:
-
-The asset name carries the version, so the URL names the release rather than
-`latest` — you always know which binary you have.
+A prebuilt arm64-v8a binary is attached to every
+[release](https://github.com/minsuk22/exynos-gemm-vulkan-bench/releases), so
+there is no NDK to set up. The asset name carries the version and the URL names
+the release rather than `latest`, so you always know which binary you have.
 
 ```sh
 BIN=gemm_vk_bench-v0.5.0-android-arm64-v8a
 curl -LO https://github.com/minsuk22/exynos-gemm-vulkan-bench/releases/download/v0.5.0/$BIN
 adb push $BIN /data/local/tmp/
 adb shell chmod 755 /data/local/tmp/$BIN
-adb shell /data/local/tmp/$BIN --mode check --iters 2
 ```
+
+Then, in order of what you probably want:
+
+```sh
+# 1. what am I holding? version, and the 168 embedded kernels with their
+#    FMA counts. Touches no GPU, so it also works as a smoke test.
+adb shell /data/local/tmp/$BIN --version
+
+# 2. does the GPU compute the right matrix? checks against a CPU reference
+#    and that every kernel agrees bit-for-bit.
+adb shell /data/local/tmp/$BIN --mode check --iters 2
+
+# 3. the benchmark: A 576x160 * B 160x960 at tile 4x4 -- the four staging
+#    variants, single and double buffered, so 7 kernels
+adb shell /data/local/tmp/$BIN
+
+# 4. every built tile and mapping, ranked
+adb shell /data/local/tmp/$BIN --sweep --iters 50
+```
+
+Run `--mode check` at least once on a new device before trusting any number
+from `--mode perf`: it is the only thing that catches a kernel that is fast
+because it is computing the wrong matrix.
 
 ## Build
 
@@ -215,6 +238,42 @@ adb push out/$BIN /data/local/tmp/
 adb shell chmod 755 /data/local/tmp/$BIN
 adb shell /data/local/tmp/$BIN --mode perf
 ```
+
+### Asking one question at a time
+
+A full sweep ranks everything at once, which is the wrong tool when you want to
+know whether a single change pays. Each axis can be isolated — hold the rest
+fixed and let the flag run both settings side by side:
+
+```sh
+D=/data/local/tmp/$BIN
+
+# does the split B mapping pay, and where? (both settings, TN=8 tiles)
+adb shell $D --tile 4x8 --tile 6x8 --tile 8x8 --b-split both
+
+# ... narrowed to the two variants that read B straight from global memory,
+#     where it moves the load addresses rather than the LDS reads
+adb shell $D --tile 8x8 --b-split both --kernels none,shared_a
+
+# does ping-ponging the LDS tiles pay?
+adb shell $D --tile 8x8 --double-buffer both --kernels shared_ab
+
+# is uploading A transposed worth it?
+adb shell $D --a-layout both --kernels shared_a
+
+# how does the answer move with the shape?
+adb shell $D --sizes 576x160x960,2048,4096 --tile 8x8
+
+# keep the numbers for later
+adb shell $D --sweep --iters 50 --csv /data/local/tmp/gemm.csv
+adb pull /data/local/tmp/gemm.csv
+```
+
+`--tile` is repeatable; `--kernels`, `--a-layout`, `--double-buffer` and
+`--b-split` all narrow or widen the set independently. Every combination they
+name is SPIR-V that was already compiled into the binary — no shader is built
+at runtime, only the Vulkan pipelines for the kernels you actually selected,
+which is why narrowing the set also cuts the startup cost.
 
 ## Modes
 
