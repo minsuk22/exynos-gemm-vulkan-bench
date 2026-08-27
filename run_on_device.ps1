@@ -1,15 +1,16 @@
 # Push gemm_vk_bench to a connected Android device and run it.
 #
-#   .\run_on_device.ps1                     # perf mode, 2048 + 4096, 5 iters
+#   .\run_on_device.ps1                     # perf mode, 576x160x960, 5 iters
 #   .\run_on_device.ps1 -Mode check         # verify results as well
-#   .\run_on_device.ps1 -ExtraArgs "--sizes 4096 --iters 10"
+#   .\run_on_device.ps1 -ExtraArgs "--sizes 4096 --iters 50"
 #
 # Results are printed live and also saved to results\<timestamp>.{log,csv}.
 
 param(
     [ValidateSet("perf", "check")]
     [string]$Mode      = "perf",
-    [string]$Sizes     = "2048,4096",
+    # MxKxN, i.e. A MxK times B KxN. A bare number is a square size.
+    [string]$Sizes     = "576x160x960",
     [int]$Iters        = 5,
     [int]$Warmup       = 2,
     [switch]$Sweep,        # run every built (TM,TN) tile and rank them

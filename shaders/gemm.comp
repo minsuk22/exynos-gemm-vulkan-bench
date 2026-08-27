@@ -18,6 +18,7 @@
 //   A_COL_MAJOR    storage order of A (B and C are always row-major)
 //   TM / TN        micro-tile computed per invocation
 //   DOUBLE_BUFFER  ping-pong the LDS tiles (only meaningful with USE_LDS)
+//   B_SPLIT        group size of the interleaved B column mapping (0 = off)
 //
 
 #ifndef TS
@@ -46,6 +47,17 @@
 #ifndef DOUBLE_BUFFER
 #define DOUBLE_BUFFER 0
 #endif
+#ifndef B_SPLIT
+#define B_SPLIT 0
+#endif
+
+// Nested rather than "#if B_SPLIT && (TN % B_SPLIT)": glslang's preprocessor
+// evaluates both sides of && and would divide by zero when B_SPLIT is 0.
+#if B_SPLIT
+#  if (TN % B_SPLIT) != 0
+#    error "B_SPLIT must divide TN"
+#  endif
+#endif
 
 #define USE_LDS (USE_SHARED_A || USE_SHARED_B)
 // Double buffering is a property of the LDS staging; with no LDS there is
@@ -69,6 +81,46 @@
 #define A_AT(m, k) A[(k) * p.M + (m)]
 #else
 #define A_AT(m, k) A[(m) * p.K + (k)]
+#endif
+
+// Column mapping: which columns of B -- and so of C -- the TN accumulators of
+// one invocation belong to.
+//
+//   B_SPLIT 0   invocation x owns one run of TN columns, x*TN .. x*TN+TN-1.
+//               Its own TN loads for a given k are contiguous, but the four
+//               that a 16-byte transaction would cover sit TN floats away from
+//               invocation x+1's four, so the wave's first quarter of loads is
+//               strided across the whole BN-wide tile instead of packed.
+//
+//   B_SPLIT G   the TN columns are cut into TN/G groups of G, and group g of
+//               invocation x lands at g*(TS*G) + x*G. Consecutive invocations
+//               are then exactly G floats apart inside a group, so the wave's
+//               g-th group of loads is one unbroken run of TS*G columns.
+//
+//               TS=2, TN=8 (a 16-wide block tile, two groups of four):
+//                  off  x=0: 0 1 2 3 4 5 6 7    x=1: 8 9 A B C D E F
+//                  on   x=0: 0 1 2 3 8 9 A B    x=1: 4 5 6 7 C D E F
+//
+// C is stored through the same mapping, so the matrix produced is unchanged and
+// still bit-identical: only which invocation owns which column moves, and with
+// it the address pattern of the global B loads (none / shared_a) or of the LDS
+// reads (shared_b / shared_ab).
+//
+// GCOL is deliberately left unparenthesised in the off case. Every use sits in
+// an additive context, and wrapping it changes the grouping of the B load
+// address from (base + gCol) + J to base + (gCol + J), which makes spirv-opt
+// materialise gCol+J inside the k loop instead of folding it into the address.
+// The instruction count is the same either way, but the off build then stops
+// being the exact kernel it was before this axis existed -- and the point of
+// the axis is that only the mapping changes. With the macro as written, a
+// B_SPLIT=0 build is byte-identical to the pre-B_SPLIT one.
+#if B_SPLIT
+#define BCOL(J) ((uint(J) / B_SPLIT) * (TS * B_SPLIT)                          \
+                 + gl_LocalInvocationID.x * B_SPLIT + (uint(J) % B_SPLIT))
+#define GCOL(J) (blockCol + BCOL(J))
+#else
+#define BCOL(J) (threadCol + (J))
+#define GCOL(J) gCol + (J)
 #endif
 
 layout(local_size_x = TS, local_size_y = TS, local_size_z = 1) in;
@@ -210,9 +262,9 @@ void main()
 #define GET_A(BUF, KT, KK, I) A_AT(gRow + (I), (KT) + (KK))
 #endif
 #if USE_SHARED_B
-#define GET_B(BUF, KT, KK, J) BS(BUF, KK, threadCol + (J))
+#define GET_B(BUF, KT, KK, J) BS(BUF, KK, BCOL(J))
 #else
-#define GET_B(BUF, KT, KK, J) B[((KT) + (KK)) * p.N + gCol + (J)]
+#define GET_B(BUF, KT, KK, J) B[((KT) + (KK)) * p.N + GCOL(J)]
 #endif
 
 #define COMPUTE_TILE(BUF, KT)                                                  \
@@ -290,8 +342,11 @@ void main()
     [[unroll]] for (uint i = 0; i < TM; ++i) {
         if (gRow + i >= p.M) continue;
         [[unroll]] for (uint j = 0; j < TN; ++j) {
-            if (gCol + j < p.N)
-                C[(gRow + i) * p.N + gCol + j] = acc[i][j];
+            // Expanded twice rather than held in a local, so that with B_SPLIT
+            // off this is character-for-character the mapping it replaced and
+            // the generated SPIR-V is unchanged.
+            if (GCOL(j) < p.N)
+                C[(gRow + i) * p.N + GCOL(j)] = acc[i][j];
         }
     }
 }
