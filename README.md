@@ -165,8 +165,8 @@ there is no NDK to set up. The asset name carries the version and the URL names
 the release rather than `latest`, so you always know which binary you have.
 
 ```sh
-BIN=gemm_vk_bench-v0.5.0-android-arm64-v8a
-curl -LO https://github.com/minsuk22/exynos-gemm-vulkan-bench/releases/download/v0.5.0/$BIN
+BIN=gemm_vk_bench-v0.6.0-android-arm64-v8a
+curl -LO https://github.com/minsuk22/exynos-gemm-vulkan-bench/releases/download/v0.6.0/$BIN
 adb push $BIN /data/local/tmp/
 adb shell chmod 755 /data/local/tmp/$BIN
 ```
@@ -271,7 +271,7 @@ saves the console log plus a CSV under `results\`.
 Manual equivalent (any OS with adb):
 
 ```sh
-BIN=gemm_vk_bench-v0.5.0-android-arm64-v8a
+BIN=gemm_vk_bench-v0.6.0-android-arm64-v8a
 adb push out/$BIN /data/local/tmp/
 adb shell chmod 755 /data/local/tmp/$BIN
 adb shell /data/local/tmp/$BIN --mode perf
