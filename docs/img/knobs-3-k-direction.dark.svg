@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="296" viewBox="0 0 880 296" role="img" aria-label="row-major B에서 K타일 한 장은 3840바이트 간격의 조각 16개로 흩어져 있고 패킹하면 하나의 연속 구간이 된다">
+<title>row-major B에서 K타일 한 장은 3840바이트 간격의 조각 16개로 흩어져 있고 패킹하면 하나의 연속 구간이 된다</title>
+<rect x="0" y="0" width="880" height="296" fill="#141C1F"/>
+        <text font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="500" fill="#E6EDEF" x="40" y="26">현재 — row-major B</text>
+        <rect fill="#0E3841" stroke="#56C6DA" stroke-width="1.2" x="40"  y="40" width="60" height="32"></rect>
+        <rect fill="#0E3841" stroke="#56C6DA" stroke-width="1.2" x="220" y="40" width="60" height="32"></rect>
+        <rect fill="#0E3841" stroke="#56C6DA" stroke-width="1.2" x="400" y="40" width="60" height="32"></rect>
+        <rect fill="#0E3841" stroke="#56C6DA" stroke-width="1.2" x="740" y="40" width="60" height="32"></rect>
+        <line stroke="#6D8088" stroke-width="1" stroke-dasharray="3 3" x1="100" y1="56" x2="220" y2="56"></line>
+        <line stroke="#6D8088" stroke-width="1" stroke-dasharray="3 3" x1="280" y1="56" x2="400" y2="56"></line>
+        <line stroke="#6D8088" stroke-width="1" stroke-dasharray="3 3" x1="460" y1="56" x2="565" y2="56"></line>
+        <line stroke="#6D8088" stroke-width="1" stroke-dasharray="3 3" x1="635" y1="56" x2="740" y2="56"></line>
+        <text font-family="ui-monospace, SFMono-Regular, Consolas, Menlo, monospace" font-size="12" fill="#9CAEB5" x="600" y="61" text-anchor="middle">···</text>
+        <text font-family="ui-monospace, SFMono-Regular, Consolas, Menlo, monospace" font-size="10.5" fill="#6D8088" x="160" y="90" text-anchor="middle">+3840 B</text>
+        <text font-family="ui-monospace, SFMono-Regular, Consolas, Menlo, monospace" font-size="10.5" fill="#6D8088" x="340" y="90" text-anchor="middle">+3840 B</text>
+        <text font-family="ui-monospace, SFMono-Regular, Consolas, Menlo, monospace" font-size="10.5" fill="#6D8088" x="70"  y="112" text-anchor="middle">k=0</text>
+        <text font-family="ui-monospace, SFMono-Regular, Consolas, Menlo, monospace" font-size="10.5" fill="#6D8088" x="250" y="112" text-anchor="middle">k=1</text>
+        <text font-family="ui-monospace, SFMono-Regular, Consolas, Menlo, monospace" font-size="10.5" fill="#6D8088" x="430" y="112" text-anchor="middle">k=2</text>
+        <text font-family="ui-monospace, SFMono-Regular, Consolas, Menlo, monospace" font-size="10.5" fill="#6D8088" x="770" y="112" text-anchor="middle">k=15</text>
+        <text font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="12" fill="#9CAEB5" x="40" y="142">512 B 조각 16개가 61 KB에 걸쳐 흩어져 있다</text>
+
+        <text font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="500" fill="#E6EDEF" x="40" y="192">패킹 — 타일 단위로 미리 모아둔 B</text>
+        <rect fill="#0E3841" stroke="#56C6DA" stroke-width="1.2" x="40" y="206" width="660" height="32"></rect>
+        <line stroke="#26343A" stroke-width="1" x1="81"  y1="206" x2="81"  y2="238"></line>
+        <line stroke="#26343A" stroke-width="1" x1="122" y1="206" x2="122" y2="238"></line>
+        <line stroke="#26343A" stroke-width="1" x1="163" y1="206" x2="163" y2="238"></line>
+        <line stroke="#26343A" stroke-width="1" x1="204" y1="206" x2="204" y2="238"></line>
+        <line stroke="#26343A" stroke-width="1" x1="245" y1="206" x2="245" y2="238"></line>
+        <line stroke="#26343A" stroke-width="1" x1="287" y1="206" x2="287" y2="238"></line>
+        <line stroke="#26343A" stroke-width="1" x1="328" y1="206" x2="328" y2="238"></line>
+        <line stroke="#26343A" stroke-width="1" x1="369" y1="206" x2="369" y2="238"></line>
+        <line stroke="#26343A" stroke-width="1" x1="410" y1="206" x2="410" y2="238"></line>
+        <line stroke="#26343A" stroke-width="1" x1="452" y1="206" x2="452" y2="238"></line>
+        <line stroke="#26343A" stroke-width="1" x1="493" y1="206" x2="493" y2="238"></line>
+        <line stroke="#26343A" stroke-width="1" x1="534" y1="206" x2="534" y2="238"></line>
+        <line stroke="#26343A" stroke-width="1" x1="575" y1="206" x2="575" y2="238"></line>
+        <line stroke="#26343A" stroke-width="1" x1="617" y1="206" x2="617" y2="238"></line>
+        <line stroke="#26343A" stroke-width="1" x1="658" y1="206" x2="658" y2="238"></line>
+        <text font-family="ui-monospace, SFMono-Regular, Consolas, Menlo, monospace" font-size="10.5" fill="#6D8088" x="60"  y="258" text-anchor="middle">k=0</text>
+        <text font-family="ui-monospace, SFMono-Regular, Consolas, Menlo, monospace" font-size="10.5" fill="#6D8088" x="679" y="258" text-anchor="middle">k=15</text>
+        <text font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="12" fill="#9CAEB5" x="40" y="286">같은 16조각이 8192 B 연속 — 건너뛰기가 사라진다</text>
+      </svg>

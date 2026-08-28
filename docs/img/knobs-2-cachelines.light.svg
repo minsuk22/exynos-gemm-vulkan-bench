@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="268" viewBox="0 0 880 268" role="img" aria-label="로드 명령 하나가 건드리는 64바이트 캐시라인 수 비교, 선형 담당은 8개 분할 담당은 4개">
+<title>로드 명령 하나가 건드리는 64바이트 캐시라인 수 비교, 선형 담당은 8개 분할 담당은 4개</title>
+<rect x="0" y="0" width="880" height="268" fill="#FFFFFF"/>
+        <text font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="500" fill="#0F1619" x="40" y="26">선형 담당 — 원본 배치든 &#9312;재배열이든 동일</text>
+        <rect fill="#D3E9EE" stroke="#7FBECB" stroke-width="1" x="40"  y="38" width="100" height="34"></rect>
+        <rect fill="#D3E9EE" stroke="#7FBECB" stroke-width="1" x="140" y="38" width="100" height="34"></rect>
+        <rect fill="#D3E9EE" stroke="#7FBECB" stroke-width="1" x="240" y="38" width="100" height="34"></rect>
+        <rect fill="#D3E9EE" stroke="#7FBECB" stroke-width="1" x="340" y="38" width="100" height="34"></rect>
+        <rect fill="#D3E9EE" stroke="#7FBECB" stroke-width="1" x="440" y="38" width="100" height="34"></rect>
+        <rect fill="#D3E9EE" stroke="#7FBECB" stroke-width="1" x="540" y="38" width="100" height="34"></rect>
+        <rect fill="#D3E9EE" stroke="#7FBECB" stroke-width="1" x="640" y="38" width="100" height="34"></rect>
+        <rect fill="#D3E9EE" stroke="#7FBECB" stroke-width="1" x="740" y="38" width="100" height="34"></rect>
+        <rect fill="#8A5008" x="40"  y="38" width="7" height="34"></rect>
+        <rect fill="#8A5008" x="90"  y="38" width="7" height="34"></rect>
+        <rect fill="#8A5008" x="140" y="38" width="7" height="34"></rect>
+        <rect fill="#8A5008" x="190" y="38" width="7" height="34"></rect>
+        <rect fill="#8A5008" x="240" y="38" width="7" height="34"></rect>
+        <rect fill="#8A5008" x="290" y="38" width="7" height="34"></rect>
+        <rect fill="#8A5008" x="340" y="38" width="7" height="34"></rect>
+        <rect fill="#8A5008" x="390" y="38" width="7" height="34"></rect>
+        <rect fill="#8A5008" x="440" y="38" width="7" height="34"></rect>
+        <rect fill="#8A5008" x="490" y="38" width="7" height="34"></rect>
+        <rect fill="#8A5008" x="540" y="38" width="7" height="34"></rect>
+        <rect fill="#8A5008" x="590" y="38" width="7" height="34"></rect>
+        <rect fill="#8A5008" x="640" y="38" width="7" height="34"></rect>
+        <rect fill="#8A5008" x="690" y="38" width="7" height="34"></rect>
+        <rect fill="#8A5008" x="740" y="38" width="7" height="34"></rect>
+        <rect fill="#8A5008" x="790" y="38" width="7" height="34"></rect>
+        <text font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="12" fill="#47575E" x="40" y="92">주소 간격 32 B → 64 B 라인 8개를 전부 깨움, 라인당 8 B만 사용</text>
+
+        <text font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="13" font-weight="500" fill="#0F1619" x="40" y="136">&#9313; 분할 담당 (--b-split on)</text>
+        <rect fill="#D3E9EE" stroke="#7FBECB" stroke-width="1" x="40"  y="148" width="100" height="34"></rect>
+        <rect fill="#D3E9EE" stroke="#7FBECB" stroke-width="1" x="140" y="148" width="100" height="34"></rect>
+        <rect fill="#D3E9EE" stroke="#7FBECB" stroke-width="1" x="240" y="148" width="100" height="34"></rect>
+        <rect fill="#D3E9EE" stroke="#7FBECB" stroke-width="1" x="340" y="148" width="100" height="34"></rect>
+        <rect fill="#FFFFFF" stroke="#D5DEE2" stroke-width="1"    x="440" y="148" width="100" height="34"></rect>
+        <rect fill="#FFFFFF" stroke="#D5DEE2" stroke-width="1"    x="540" y="148" width="100" height="34"></rect>
+        <rect fill="#FFFFFF" stroke="#D5DEE2" stroke-width="1"    x="640" y="148" width="100" height="34"></rect>
+        <rect fill="#FFFFFF" stroke="#D5DEE2" stroke-width="1"    x="740" y="148" width="100" height="34"></rect>
+        <rect fill="#8A5008" x="40"  y="148" width="7" height="34"></rect>
+        <rect fill="#8A5008" x="65"  y="148" width="7" height="34"></rect>
+        <rect fill="#8A5008" x="90"  y="148" width="7" height="34"></rect>
+        <rect fill="#8A5008" x="115" y="148" width="7" height="34"></rect>
+        <rect fill="#8A5008" x="140" y="148" width="7" height="34"></rect>
+        <rect fill="#8A5008" x="165" y="148" width="7" height="34"></rect>
+        <rect fill="#8A5008" x="190" y="148" width="7" height="34"></rect>
+        <rect fill="#8A5008" x="215" y="148" width="7" height="34"></rect>
+        <rect fill="#8A5008" x="240" y="148" width="7" height="34"></rect>
+        <rect fill="#8A5008" x="265" y="148" width="7" height="34"></rect>
+        <rect fill="#8A5008" x="290" y="148" width="7" height="34"></rect>
+        <rect fill="#8A5008" x="315" y="148" width="7" height="34"></rect>
+        <rect fill="#8A5008" x="340" y="148" width="7" height="34"></rect>
+        <rect fill="#8A5008" x="365" y="148" width="7" height="34"></rect>
+        <rect fill="#8A5008" x="390" y="148" width="7" height="34"></rect>
+        <rect fill="#8A5008" x="415" y="148" width="7" height="34"></rect>
+        <text font-family="system-ui, -apple-system, Segoe UI, Roboto, sans-serif" font-size="12" fill="#47575E" x="40" y="202">주소 간격 16 B → 라인 4개만 깨움, 라인당 16 B 사용</text>
+
+        <line stroke="#D5DEE2" stroke-width="1" x1="40" y1="228" x2="840" y2="228"></line>
+        <text font-family="ui-monospace, SFMono-Regular, Consolas, Menlo, monospace" font-size="10.5" fill="#74858C" x="40"  y="246">0 B</text>
+        <text font-family="ui-monospace, SFMono-Regular, Consolas, Menlo, monospace" font-size="10.5" fill="#74858C" x="240" y="246">128</text>
+        <text font-family="ui-monospace, SFMono-Regular, Consolas, Menlo, monospace" font-size="10.5" fill="#74858C" x="440" y="246">256</text>
+        <text font-family="ui-monospace, SFMono-Regular, Consolas, Menlo, monospace" font-size="10.5" fill="#74858C" x="640" y="246">384</text>
+        <text font-family="ui-monospace, SFMono-Regular, Consolas, Menlo, monospace" font-size="10.5" fill="#74858C" x="808" y="246">512 B</text>
+      </svg>

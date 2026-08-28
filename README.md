@@ -97,6 +97,13 @@ still bit-identical — only which invocation owns which column moves, and with
 it the address pattern of the global `B` loads (`none`, `shared_a`) or of the
 LDS reads (`shared_b`, `shared_ab`).
 
+This is a change of *assignment*, not of *layout* — B is uploaded once,
+row-major, and never touched again; only the column each accumulator belongs to
+moves. The two are duals for the n direction and the assignment side is the free
+one, which is why it is the side that got built. What only a layout change can
+buy — the k direction, where B jumps `N` floats per k-step — is drawn out in
+[docs/b-matrix-knobs.md](docs/b-matrix-knobs.md).
+
 Only built where it can differ from the default: `TN` must be a multiple of four
 and hold more than one group, so of the nine tiles only the three with `TN=8`
 get a second copy (42 of the 168 kernels). `--b-split off/on/both`, default
