@@ -122,6 +122,7 @@ struct KernelDesc {
     uint32_t        db;        // 1 = LDS tiles are ping-ponged
     uint32_t        bsplit;    // 0 = one run of TN columns per invocation,
                                // else the group size the run is split into
+    uint32_t        vgpr;      // register sets held for the operand fragments
     const uint32_t* spv;
     size_t          spvBytes;
 
@@ -138,6 +139,8 @@ struct KernelDesc {
         if (bSrc[0] == 's') n += kTileK * blockN() * 4u;
         return n * (db ? 2u : 1u);
     }
+    // Per-invocation fragment registers: one set per pipeline stage.
+    uint32_t fragRegs() const { return vgpr * (tm + tn); }
     // Per-invocation prefetch registers held across the compute phase.
     uint32_t prefetchRegs() const {
         if (!db) return 0;
@@ -161,6 +164,9 @@ static const char*    kDefaultALayout = "col";
 
 // Group size of the split B column mapping. Must match B_SPLITS in CMakeLists.
 static const uint32_t kBSplitGroup = 4;
+
+// Operand-fragment pipeline depths built. Must match VGPR_MODES in CMakeLists.
+static const uint32_t kVgprModes[] = { 1, 3 };
 
 // Only built where the split mapping actually differs from the linear one: TN
 // has to be a multiple of the group size and hold more than one group, so TN=4
@@ -234,6 +240,7 @@ struct Options {
     std::vector<std::string> aLayouts;                  // "col" and/or "row"
     std::vector<int>      dbModes;                      // 0 and/or 1
     std::vector<int>      bSplits;                      // 0 and/or kBSplitGroup
+    std::vector<int>      vgprModes;                    // from kVgprModes
     std::vector<int>      kernels;                      // resolved indices into kKernels
     bool        sweep       = false;
     int         iters       = 5;
@@ -271,6 +278,9 @@ static void usage(const char* argv0)
 "                        on splits an invocation's TN columns into groups of\n"
 "                        4 spread across the block tile, so a wave's loads for\n"
 "                        one group are contiguous. Only built for TN=8\n"
+"  --vgpr <n>            operand fragment pipeline depth: both (default), 1\n"
+"                        or 3. 3 holds three fragment register sets and issues\n"
+"                        the load for k-step kk+2 before the FMAs of step kk\n"
 "  --sweep               run every built (TM,TN) pair and rank the results\n"
 "  --samples <n>         check mode: random output elements to verify (default 4096)\n"
 "  --full-check          check mode: verify every element with a CPU GEMM (slow)\n"
@@ -338,11 +348,11 @@ static Options parseArgs(int argc, char** argv)
                 uint32_t fma = countFma(kd.spv, kd.spvBytes);
                 bool ok = (fma == kd.expectedFma());
                 if (!ok) ++bad;
-                printf("  %-10s %ux%u A-%s %-6s %-4s block %3ux%-3u LDS %5uB pre %2u  "
+                printf("  %-10s %ux%u A-%s %-6s %-4s v%u block %3ux%-3u LDS %5uB frag %3u pre %2u  "
                        "%6u B  %5u Fma (expect %5u) %s\n",
                        kd.name, kd.tm, kd.tn, kd.aLayout, kd.db ? "db" : "single",
-                       kd.bsplit ? "bs4" : "bs-",
-                       kd.blockM(), kd.blockN(), kd.ldsBytes(), kd.prefetchRegs(),
+                       kd.bsplit ? "bs4" : "bs-", kd.vgpr,
+                       kd.blockM(), kd.blockN(), kd.ldsBytes(), kd.fragRegs(), kd.prefetchRegs(),
                        (unsigned)kd.spvBytes, fma, kd.expectedFma(),
                        ok ? "ok" : "MISMATCH");
             }
@@ -404,6 +414,14 @@ static Options parseArgs(int argc, char** argv)
             else if (b == "both") o.bSplits = { 0, (int)kBSplitGroup };
             else die("--b-split expects on, off or both (got '%s')", b.c_str());
         }
+        else if (a == "--vgpr") {
+            std::string v = need(i, "--vgpr"); ++i;
+            o.vgprModes.clear();
+            if (v == "1")        o.vgprModes = { 1 };
+            else if (v == "3")   o.vgprModes = { 3 };
+            else if (v == "both") o.vgprModes = { 1, 3 };
+            else die("--vgpr expects 1, 3 or both (got '%s')", v.c_str());
+        }
         else if (a == "--sweep")        { o.sweep = true; }
         else if (a == "--iters")        { o.iters = atoi(need(i, "--iters")); ++i; }
         else if (a == "--warmup")       { o.warmup = atoi(need(i, "--warmup")); ++i; }
@@ -443,6 +461,8 @@ static Options parseArgs(int argc, char** argv)
     if (o.aLayouts.empty()) o.aLayouts.push_back(kDefaultALayout);
     if (o.dbModes.empty())  o.dbModes = { 0, 1 };
     if (o.bSplits.empty())  o.bSplits = { 0, (int)kBSplitGroup };
+    if (o.vgprModes.empty())
+        for (uint32_t v : kVgprModes) o.vgprModes.push_back((int)v);
 
     // Layout is the outermost loop: switching it means re-uploading A, so this
     // ordering keeps that to one upload per layout per shape. The B mapping is
@@ -452,11 +472,13 @@ static Options parseArgs(int argc, char** argv)
             for (const std::string& v : o.variants) {
                 for (int db : o.dbModes) {
                     for (int bs : o.bSplits) {
+                      for (int vg : o.vgprModes) {
                         int found = -1;
                         for (int k = 0; k < kNumKernels; ++k)
                             if (v == kKernels[k].name && kKernels[k].aLayout == lay &&
                                 kKernels[k].tm == t.first && kKernels[k].tn == t.second &&
-                                (int)kKernels[k].db == db && (int)kKernels[k].bsplit == bs)
+                                (int)kKernels[k].db == db && (int)kKernels[k].bsplit == bs &&
+                                (int)kKernels[k].vgpr == vg)
                                 found = k;
                         // "none" has no LDS, so no db=1 build exists; that is not
                         // an error, there is simply nothing to ping-pong.
@@ -465,9 +487,10 @@ static Options parseArgs(int argc, char** argv)
                         // group has only the one mapping.
                         if (found < 0 && bs != 0 && !bSplitBuilt(t.second)) continue;
                         if (found < 0)
-                            die("no kernel built for %s tile %ux%u A-%s db=%d bsplit=%d (see --help)",
-                                v.c_str(), t.first, t.second, lay.c_str(), db, bs);
+                            die("no kernel built for %s tile %ux%u A-%s db=%d bsplit=%d vgpr=%d (see --help)",
+                                v.c_str(), t.first, t.second, lay.c_str(), db, bs, vg);
                         o.kernels.push_back(found);
+                      }
                     }
                 }
             }
@@ -894,9 +917,9 @@ int main(int argc, char** argv)
             if (kd.ldsBytes() <= ctx.props.limits.maxComputeSharedMemorySize) {
                 fits.push_back(kidx);
             } else {
-                printf("  SKIP %s %ux%u A-%s%s%s: needs %u B of LDS, device allows %u\n",
+                printf("  SKIP %s %ux%u A-%s%s%s v%u: needs %u B of LDS, device allows %u\n",
                        kd.name, kd.tm, kd.tn, kd.aLayout, kd.db ? " db" : "",
-                       kd.bsplit ? " bs4" : "",
+                       kd.bsplit ? " bs4" : "", kd.vgpr,
                        kd.ldsBytes(), ctx.props.limits.maxComputeSharedMemorySize);
             }
         }
@@ -996,7 +1019,8 @@ int main(int argc, char** argv)
         csv = fopen(o.csvPath.c_str(), "w");
         if (!csv) die("cannot open CSV file '%s'", o.csvPath.c_str());
         fprintf(csv, "device,m,n,k,kernel,a_source,b_source,a_layout,double_buffer,"
-                     "b_split,tm,tn,block_m,block_n,lds_bytes,prefetch_regs,"
+                     "b_split,vgpr_stages,tm,tn,block_m,block_n,lds_bytes,"
+                     "frag_regs,prefetch_regs,"
                      "run,gpu_ms,wall_ms,gflop,tflops\n");
     }
 
@@ -1195,12 +1219,12 @@ int main(int argc, char** argv)
                 }
             };
 
-            printf("[%-9s %ux%u A-%s %-6s %-4s]  A:%s  B:%s  block %ux%u  grid %ux%u  "
-                   "LDS %uB  prefetch %u regs\n",
+            printf("[%-9s %ux%u A-%s %-6s %-4s v%u]  A:%s  B:%s  block %ux%u  grid %ux%u  "
+                   "LDS %uB  frag %u regs  prefetch %u regs\n",
                    kd.name, kd.tm, kd.tn, kd.aLayout, kd.db ? "db" : "single",
-                   kd.bsplit ? "bs4" : "bs-",
+                   kd.bsplit ? "bs4" : "bs-", kd.vgpr,
                    kd.aSrc, kd.bSrc, kd.blockM(), kd.blockN(), gx, gy,
-                   kd.ldsBytes(), kd.prefetchRegs());
+                   kd.ldsBytes(), kd.fragRegs(), kd.prefetchRegs());
 
             for (int w2 = 0; w2 < o.warmup; ++w2) runOnce(nullptr, nullptr);
 
@@ -1219,10 +1243,10 @@ int main(int argc, char** argv)
                        it + 1, o.iters, gpuStr, wm, tflops(gflop, t));
                 fflush(stdout);
                 if (csv)
-                    fprintf(csv, "%s,%u,%u,%u,%s,%s,%s,%s,%u,%u,%u,%u,%u,%u,%u,%u,%d,%.6f,%.6f,%.3f,%.6f\n",
+                    fprintf(csv, "%s,%u,%u,%u,%s,%s,%s,%s,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%d,%.6f,%.6f,%.3f,%.6f\n",
                             ctx.props.deviceName, M, N, K, kd.name, kd.aSrc, kd.bSrc, kd.aLayout,
-                            kd.db, kd.bsplit, kd.tm, kd.tn, kd.blockM(), kd.blockN(),
-                            kd.ldsBytes(), kd.prefetchRegs(), it + 1,
+                            kd.db, kd.bsplit, kd.vgpr, kd.tm, kd.tn, kd.blockM(), kd.blockN(),
+                            kd.ldsBytes(), kd.fragRegs(), kd.prefetchRegs(), it + 1,
                             g, wm, gflop, tflops(gflop, t));
             }
 
@@ -1308,14 +1332,14 @@ int main(int argc, char** argv)
         }
 
         const char* kSep =
-            "-----------------------------------------------------------------------------------------------------\n";
+            "------------------------------------------------------------------------------------------------------------\n";
         printf("%s", kSep);
         printf(" summary  A %ux%u * B %ux%u   (%.3f GFLOP per GEMM, %d runs, ranked by best time)\n",
                M, K, K, N, gflop, o.iters);
         printf("%s", kSep);
-        printf(" %4s %-10s %5s %-9s %-16s %6s %7s %6s %9s %9s %10s %8s\n",
+        printf(" %4s %-10s %5s %-9s %-16s %6s %7s %6s %5s %9s %9s %10s %8s\n",
                "rank", "kernel", "tile", "block", "A / B", "A-ord", "dbuf", "bsplit",
-               "best_ms", "med_ms", "TFLOPS_bst", "vs best");
+               "vgpr", "best_ms", "med_ms", "TFLOPS_bst", "vs best");
         printf("%s", kSep);
 
         // Rank by best time. The FLOP count is the logical 2*M*N*K, so a tiling
@@ -1334,18 +1358,18 @@ int main(int argc, char** argv)
             snprintf(tile,  sizeof(tile),  "%ux%u", kd.tm, kd.tn);
             snprintf(block, sizeof(block), "%ux%u", kd.blockM(), kd.blockN());
             snprintf(ab,    sizeof(ab),    "%s / %s", kd.aSrc, kd.bSrc);
-            printf(" %4zu %-10s %5s %-9s %-16s %6s %7s %6s %9.3f %9.3f %10.4f %7.2fx\n",
+            printf(" %4zu %-10s %5s %-9s %-16s %6s %7s %6s %5u %9.3f %9.3f %10.4f %7.2fx\n",
                    r + 1, kd.name, tile, block, ab, kd.aLayout,
-                   kd.db ? "on" : "off", kd.bsplit ? "on" : "off", row.best, row.med,
+                   kd.db ? "on" : "off", kd.bsplit ? "on" : "off", kd.vgpr, row.best, row.med,
                    tflops(gflop, row.best), topBest / row.best);
         }
         printf("%s", kSep);
         if (!rows.empty()) {
             const Row& w = rows[order[0]];
             printf(" BEST at %ux%ux%u: %s  tile %ux%u  A %s-major  double-buffer %s"
-                   "  B-split %s  (block %ux%u, A:%s B:%s)  %.3f ms  %.4f TFLOPS\n",
+                   "  B-split %s  vgpr %u  (block %ux%u, A:%s B:%s)  %.3f ms  %.4f TFLOPS\n",
                    M, K, N, w.kd->name, w.kd->tm, w.kd->tn, w.kd->aLayout,
-                   w.kd->db ? "on" : "off", w.kd->bsplit ? "on" : "off",
+                   w.kd->db ? "on" : "off", w.kd->bsplit ? "on" : "off", w.kd->vgpr,
                    w.kd->blockM(), w.kd->blockN(),
                    w.kd->aSrc, w.kd->bSrc, w.best, tflops(gflop, w.best));
         }

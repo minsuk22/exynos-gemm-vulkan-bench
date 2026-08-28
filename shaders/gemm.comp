@@ -19,6 +19,7 @@
 //   TM / TN        micro-tile computed per invocation
 //   DOUBLE_BUFFER  ping-pong the LDS tiles (only meaningful with USE_LDS)
 //   B_SPLIT        group size of the interleaved B column mapping (0 = off)
+//   VGPR_STAGES    register sets held for the operand fragments (1 or 3)
 //
 
 #ifndef TS
@@ -49,6 +50,13 @@
 #endif
 #ifndef B_SPLIT
 #define B_SPLIT 0
+#endif
+#ifndef VGPR_STAGES
+#define VGPR_STAGES 1
+#endif
+
+#if VGPR_STAGES != 1 && VGPR_STAGES != 3
+#error "VGPR_STAGES must be 1 or 3"
 #endif
 
 // Nested rather than "#if B_SPLIT && (TN % B_SPLIT)": glslang's preprocessor
@@ -199,8 +207,14 @@ void main()
         [[unroll]] for (int j = 0; j < TN; ++j)
             acc[i][j] = 0.0;
 
+#if VGPR_STAGES == 3
+    // Three register sets for the operand fragments, cycled kk % 3.
+    float rA[3][TM];
+    float rB[3][TN];
+#else
     float regA[TM];
     float regB[TN];
+#endif
 
 // --- staging macros ---------------------------------------------------------
 // Written once and used by both the prologue and the loop body, so the two can
@@ -267,6 +281,47 @@ void main()
 #define GET_B(BUF, KT, KK, J) B[((KT) + (KK)) * p.N + GCOL(J)]
 #endif
 
+// --- operand fragment pipelining --------------------------------------------
+//
+// VGPR_STAGES 1 loads the fragments for step kk and consumes them in the same
+// step. The BK unroll then drops every load and every FMA of the tile into one
+// basic block, and whether any of it overlaps is left entirely to the driver's
+// scheduler -- nothing in the program holds a second fragment, so there is no
+// structure for the scheduler to respect. An unrolled loop is not a buffer.
+//
+// VGPR_STAGES 3 holds three fragment sets and issues the load for step kk+2
+// before the FMAs of step kk, so two fetches are in flight across every compute
+// step and the dependency chain load(kk) -> fma(kk) is broken by two steps of
+// distance. Written without a conditional -- a prologue, a body of BK-2 steps
+// and a two-step epilogue -- so every stage index folds to a constant and the
+// fragment arrays promote to registers instead of landing in scratch.
+//
+// The FMA order is kk ascending, then i, then j, in both cases, so the two
+// produce bit-identical results. What changes is register pressure:
+// 3*(TM+TN) fragment registers instead of TM+TN, on top of acc[TM][TN].
+
+#if VGPR_STAGES == 3
+#define LOAD_FRAG(BUF, KT, KK, S)                                              \
+    [[unroll]] for (int i = 0; i < TM; ++i)                                    \
+        rA[S][i] = GET_A(BUF, KT, KK, i);                                      \
+    [[unroll]] for (int j = 0; j < TN; ++j)                                    \
+        rB[S][j] = GET_B(BUF, KT, KK, j);
+
+#define FMA_FRAG(S)                                                            \
+    [[unroll]] for (int i = 0; i < TM; ++i)                                    \
+        [[unroll]] for (int j = 0; j < TN; ++j)                                \
+            acc[i][j] = fma(rA[S][i], rB[S][j], acc[i][j]);
+
+#define COMPUTE_TILE(BUF, KT)                                                  \
+    LOAD_FRAG(BUF, KT, 0u, 0)                                                  \
+    LOAD_FRAG(BUF, KT, 1u, 1)                                                  \
+    [[unroll]] for (uint kk = 0; kk < BK - 2u; ++kk) {                         \
+        LOAD_FRAG(BUF, KT, kk + 2u, (kk + 2u) % 3u)                            \
+        FMA_FRAG(kk % 3u)                                                      \
+    }                                                                          \
+    FMA_FRAG((BK - 2u) % 3u)                                                   \
+    FMA_FRAG((BK - 1u) % 3u)
+#else
 #define COMPUTE_TILE(BUF, KT)                                                  \
     [[unroll]] for (uint kk = 0; kk < BK; ++kk) {                              \
         [[unroll]] for (int i = 0; i < TM; ++i)                                \
@@ -277,6 +332,7 @@ void main()
             [[unroll]] for (int j = 0; j < TN; ++j)                            \
                 acc[i][j] = fma(regA[i], regB[j], acc[i][j]);                  \
     }
+#endif
 
 // --- main loop --------------------------------------------------------------
 

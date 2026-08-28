@@ -66,6 +66,13 @@ set(DB_MODES 0 1)
 # main.cpp.
 set(B_SPLITS 0 4)
 
+# Register sets held for the operand fragments. 1 loads and consumes them in the
+# same k-step; 3 keeps three sets so the load for step kk+2 is issued before the
+# FMAs of step kk. Same FMA order either way, so results stay bit-identical --
+# what changes is 3*(TM+TN) fragment registers instead of TM+TN. Must match
+# kVgprModes in main.cpp.
+set(VGPR_MODES 1 3)
+
 foreach(lay IN LISTS A_LAYOUTS)
   string(REPLACE ":" ";" lparts ${lay})
   list(GET lparts 0 lsuffix)
@@ -99,6 +106,13 @@ foreach(lay IN LISTS A_LAYOUTS)
             set(dbsuffix "")
           endif()
 
+        foreach(vg IN LISTS VGPR_MODES)
+          if(vg EQUAL 1)
+            set(vgsuffix "")
+          else()
+            set(vgsuffix "_v${vg}")
+          endif()
+
         foreach(bs IN LISTS B_SPLITS)
           set(bssuffix "")
           if(bs)
@@ -112,7 +126,7 @@ foreach(lay IN LISTS A_LAYOUTS)
             set(bssuffix "_bs${bs}")
           endif()
 
-          set(stem gemm_${vname}_${tm}x${tn}_${lsuffix}${dbsuffix}${bssuffix})
+          set(stem gemm_${vname}_${tm}x${tn}_${lsuffix}${dbsuffix}${bssuffix}${vgsuffix})
           set(inc ${GEN_DIR}/${stem}.inc)
           # -mfmt=c emits a braced uint32 initializer list, used as an initializer
           add_custom_command(
@@ -120,18 +134,19 @@ foreach(lay IN LISTS A_LAYOUTS)
             COMMAND ${GLSLC} -O --target-env=vulkan1.1 -fshader-stage=compute
                     -DUSE_SHARED_A=${usea} -DUSE_SHARED_B=${useb}
                     -DTM=${tm} -DTN=${tn} -DA_COL_MAJOR=${lcol}
-                    -DDOUBLE_BUFFER=${db} -DB_SPLIT=${bs}
+                    -DDOUBLE_BUFFER=${db} -DB_SPLIT=${bs} -DVGPR_STAGES=${vg}
                     -mfmt=c -o ${inc} ${SHADER_SRC}
             DEPENDS ${SHADER_SRC}
-            COMMENT "glslc -O gemm.comp -> ${stem}.inc (A=${asrc} B=${bsrc} ${tm}x${tn} A_${llabel} db=${db} bs=${bs})"
+            COMMENT "glslc -O gemm.comp -> ${stem}.inc (A=${asrc} B=${bsrc} ${tm}x${tn} A_${llabel} db=${db} bs=${bs} vgpr=${vg})"
             VERBATIM)
           list(APPEND SPV_INCS ${inc})
 
           string(APPEND TBL_DECLS
             "static const uint32_t ${stem}_spv[] =\n#include \"${stem}.inc\"\n;\n")
           string(APPEND TBL_ROWS
-            "  { \"${vname}\", \"${asrc}\", \"${bsrc}\", \"${llabel}\", ${tm}, ${tn}, ${db}, ${bs}, "
+            "  { \"${vname}\", \"${asrc}\", \"${bsrc}\", \"${llabel}\", ${tm}, ${tn}, ${db}, ${bs}, ${vg}, "
             "${stem}_spv, sizeof(${stem}_spv) }, \\\n")
+        endforeach()
         endforeach()
         endforeach()
       endforeach()

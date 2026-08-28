@@ -39,9 +39,9 @@ which is also the check that the transpose itself is correct.
 The micro-tile each invocation computes is a build-time parameter: `TM`×`TN`
 for `TM,TN ∈ {4,6,8}`, giving a block tile of `16·TM` × `16·TN`. All nine pairs
 are built for all four staging variants, both A layouts, both double-buffer
-modes and — where it differs — both B column mappings, so `--sweep` compares
-tiling, staging, layout, buffering and the B mapping independently. 168 kernels
-are embedded.
+modes, both fragment pipeline depths and — where it differs — both B column
+mappings, so `--sweep` compares tiling, staging, layout, buffering, the B
+mapping and the register pipeline independently. 336 kernels are embedded.
 
 Larger micro-tiles raise arithmetic intensity: per k-step a kernel issues
 `TM+TN` operand loads against `TM·TN` FMAs, so 4×4 does 2 FMA per load while
@@ -106,11 +106,42 @@ buy — the k direction, where B jumps `N` floats per k-step — is drawn out in
 
 Only built where it can differ from the default: `TN` must be a multiple of four
 and hold more than one group, so of the nine tiles only the three with `TN=8`
-get a second copy (42 of the 168 kernels). `--b-split off/on/both`, default
+get a second copy (84 of the 336 kernels). `--b-split off/on/both`, default
 `both`; asking for `on` at a tile that has no split build is not an error, that
 tile simply has the one mapping. With `off` the generated SPIR-V is
 byte-identical to what it was before this axis existed, so turning the axis on
 is the only thing that can move the numbers.
+
+**VGPR pipelining.** `--vgpr 1` loads the operand fragments for k-step `kk` and
+consumes them in the same step. The `BK` unroll then drops every load and every
+FMA of the tile into one basic block and leaves any overlap entirely to the
+driver's scheduler — nothing in the program holds a second fragment, so there is
+no structure for the scheduler to respect. **An unrolled loop is not a buffer.**
+
+`--vgpr 3` holds three fragment register sets and issues the load for step
+`kk+2` before the FMAs of step `kk`, so two fetches are in flight across every
+compute step and the `load(kk) -> fma(kk)` chain is broken by two steps of
+distance. It is written without a conditional — a prologue, a body of `BK-2`
+steps and a two-step epilogue — so every stage index folds to a constant and the
+fragment arrays promote to registers rather than landing in scratch.
+
+The FMA order is `kk` ascending, then `i`, then `j`, in both, so the two are
+bit-identical; `--mode check` verifies it. It shows up in the SPIR-V as the
+drain — the number of FMAs following the last operand load:
+
+| shared_ab 8×8, A-col | vgpr 1 | vgpr 3 |
+|---|---|---|
+| fragment registers | 16 | 48 |
+| FMAs after the last operand load | 64 | **192** |
+| SPIR-V instruction count | same | same |
+
+`TM·TN` at depth 1 and `3·TM·TN` at depth 3, confirmed for all four variants
+across the tiles. The instruction count is unchanged because SPIR-V is SSA — the
+register sets vanish into value numbering and only the *order* differs. What the
+depth costs is `3·(TM+TN)` fragment registers instead of `TM+TN`, on top of
+`acc[TM][TN]`; at 8×8 that is 48 live registers against 64 accumulators. Like
+double buffering it is therefore an axis (`1` / `3` / `both`, default `both`),
+not a replacement.
 
 **Partial tiles.** A block tile need not divide the matrix — `TM=6` gives a
 block of 96, and 96 never divides a power-of-two size. The dispatch grid is
@@ -143,7 +174,7 @@ adb shell chmod 755 /data/local/tmp/$BIN
 Then, in order of what you probably want:
 
 ```sh
-# 1. what am I holding? version, and the 168 embedded kernels with their
+# 1. what am I holding? version, and the 336 embedded kernels with their
 #    FMA counts. Touches no GPU, so it also works as a smoke test.
 adb shell /data/local/tmp/$BIN --version
 
@@ -212,7 +243,7 @@ artifact, not a GPU result. `--version` prints the same summary and exits.
 
 Output: `out\gemm_vk_bench-v<version>-android-arm64-v8a` — a single
 self-contained arm64-v8a PIE. The SPIR-V
-for all 168 kernels is embedded in the binary (no shader files to push), and
+for all 336 kernels is embedded in the binary (no shader files to push), and
 the C++ runtime is statically linked, so it only needs the platform's
 `libvulkan.so` / `libc` / `libm` / `libdl`.
 
@@ -227,12 +258,12 @@ the C++ runtime is statically linked, so it only needs the platform's
 The default shape is `A 576x160 * B 160x960`; `-Sizes` takes `MxKxN` (or a bare
 number for a square case) and accepts a comma separated list.
 
-A sweep runs 84 kernels per shape: 9 tiles x 7 staging/buffering combinations,
-plus a second B mapping for the three `TN=8` tiles. The default shape is only
-0.177 GFLOP, so the whole sweep is quick — but each dispatch is well under a
-millisecond, which is small enough that submit overhead and clock ramping show
-up as run-to-run spread. Raise `--iters` (50 or more costs nothing here) and
-read the median.
+A sweep runs 168 kernels per shape: 9 tiles x 7 staging/buffering combos x 2
+pipeline depths, plus a second B mapping for the three `TN=8` tiles. The
+default shape is only 0.177 GFLOP, so a sweep is quick — but each dispatch is
+well under a millisecond, small enough that submit overhead and clock ramping
+show up as run-to-run spread. Raise `--iters` (50 or more costs nothing here)
+and read the median.
 
 The script pushes the binary to `/data/local/tmp/gemm_bench`, runs it, and
 saves the console log plus a CSV under `results\`.
@@ -309,6 +340,7 @@ which is why narrowing the set also cuts the startup cost.
 --a-layout <l>        storage order of A: col (default), row, or both
 --double-buffer <d>   LDS tile ping-pong: both (default), on, or off
 --b-split <s>         B column mapping: both (default), on, or off
+--vgpr <n>            fragment pipeline depth: both (default), 1, or 3
 --sweep               run every built (TM,TN) pair and rank the results
 --samples <n>         check mode: elements verified against CPU (default 4096)
 --full-check          check mode: verify the whole matrix on CPU (slow)
