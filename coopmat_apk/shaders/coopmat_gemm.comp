@@ -1,0 +1,130 @@
+/*
+ * Type-generic VK_KHR_cooperative_matrix GEMM:  D[MxN] = A[MxK] * B[KxN]
+ * (all row-major, alpha = 1, beta = 0, no C input).
+ *
+ * Structure follows VK_Test/shaders/gemm_v07.comp (block tile -> warp tile ->
+ * coopmat fragment, K marched in BK slabs staged through shared memory), with
+ * one change that makes it work for every element type:
+ *
+ *   A and B are never touched as their element type. Global buffers and the
+ *   shared-memory tiles are declared as LD_T (uvec4 or uint) and copied as raw
+ *   bits; coopMatLoad reinterprets them as the fragment's component type. So
+ *   int8 / fp8 / bf16 inputs need no 8- or 16-bit storage features, and the
+ *   staging copy is 16 bytes per invocation per step when LD_T = uvec4.
+ *
+ * Offsets and strides passed to coopMatLoad are in LD_T units, so the host only
+ * picks this variant when lK*A_BYTES and lN*B_BYTES are multiples of LD_BYTES.
+ *
+ * Compile-time defines (see build_shaders.sh):
+ *   A_T, B_T, C_T          GLSL component types of the A, B and accumulator/result
+ *   A_BYTES, B_BYTES       sizeof(A_T), sizeof(B_T)
+ *   LD_T, LD_BYTES         uvec4/16 or uint/4
+ *   SAT                    1 -> saturating accumulation
+ *   NEED_BF16, NEED_FP8    enable the extension that declares the type
+ */
+#version 450 core
+#pragma use_vulkan_memory_model
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
+#extension GL_EXT_control_flow_attributes : enable
+#if NEED_BF16
+#extension GL_EXT_bfloat16 : enable
+#endif
+#if NEED_FP8
+#extension GL_EXT_float_e4m3 : enable
+#extension GL_EXT_float_e5m2 : enable
+#endif
+
+layout(constant_id = 0)  const uint lM = 16;     // fragment shape advertised by the device
+layout(constant_id = 1)  const uint lN = 16;
+layout(constant_id = 2)  const uint lK = 16;
+layout(constant_id = 3)  const uint M = 2048;    // problem size
+layout(constant_id = 4)  const uint N = 2048;
+layout(constant_id = 5)  const uint K = 2048;
+layout(constant_id = 6)  const uint C_ROWS = 4;  // fragments per subgroup along M
+layout(constant_id = 7)  const uint C_COLS = 2;  // fragments per subgroup along N
+layout(constant_id = 8)  const uint WG_W = 4;    // subgroups per workgroup along N
+layout(constant_id = 9)  const uint WG_H = 2;    // subgroups per workgroup along M
+layout(constant_id = 10) const uint BK = 32;     // K slab staged per iteration (multiple of lK)
+layout(local_size_x_id = 11, local_size_y = 1, local_size_z = 1) in;
+
+const uint TILE_M = WG_H * C_ROWS * lM;
+const uint TILE_N = WG_W * C_COLS * lN;
+
+const uint EPU_A = LD_BYTES / A_BYTES;   // A elements per load unit
+const uint EPU_B = LD_BYTES / B_BYTES;
+const uint A_ROW = BK / EPU_A;           // load units in one staged A row
+const uint B_ROW = TILE_N / EPU_B;       // load units in one staged B row
+const uint SA    = A_ROW + 1;            // +1 unit of padding against bank conflicts
+const uint SB    = B_ROW + 1;
+const uint A_GROW = K / EPU_A;           // load units in one global A row
+const uint B_GROW = N / EPU_B;
+
+layout(set = 0, binding = 0) readonly  buffer BufA { LD_T a[]; };
+layout(set = 0, binding = 1) readonly  buffer BufB { LD_T b[]; };
+layout(set = 0, binding = 2) writeonly buffer BufD { C_T  d[]; };
+
+shared LD_T As[TILE_M * SA];
+shared LD_T Bs[BK * SB];
+
+#if SAT
+#define MMA(x, y, z) coopMatMulAdd(x, y, z, gl_MatrixOperandsSaturatingAccumulation)
+#else
+#define MMA(x, y, z) coopMatMulAdd(x, y, z)
+#endif
+
+void main()
+{
+    const uint tid  = gl_LocalInvocationID.x;
+    const uint nth  = gl_WorkGroupSize.x;
+    const uint sgid = gl_SubgroupID;
+    const uvec2 warp = uvec2(sgid % WG_W, sgid / WG_W);
+
+    const uint rowBase = TILE_M * gl_WorkGroupID.y;
+    const uint colBase = TILE_N * gl_WorkGroupID.x;
+
+    coopmat<C_T, gl_ScopeSubgroup, lM, lN, gl_MatrixUseAccumulator> acc[C_ROWS][C_COLS];
+    [[unroll]] for (uint i = 0; i < C_ROWS; ++i)
+        [[unroll]] for (uint j = 0; j < C_COLS; ++j)
+            acc[i][j] = coopmat<C_T, gl_ScopeSubgroup, lM, lN, gl_MatrixUseAccumulator>(0);
+
+    for (uint k0 = 0; k0 < K; k0 += BK) {
+        barrier();
+        for (uint idx = tid; idx < TILE_M * A_ROW; idx += nth) {
+            uint r = idx / A_ROW, c = idx % A_ROW;
+            As[r * SA + c] = a[(rowBase + r) * A_GROW + k0 / EPU_A + c];
+        }
+        for (uint idx = tid; idx < BK * B_ROW; idx += nth) {
+            uint r = idx / B_ROW, c = idx % B_ROW;
+            Bs[r * SB + c] = b[(k0 + r) * B_GROW + colBase / EPU_B + c];
+        }
+        barrier();
+
+        [[unroll]] for (uint kk = 0; kk < BK; kk += lK) {
+            coopmat<A_T, gl_ScopeSubgroup, lM, lK, gl_MatrixUseA> matA[C_ROWS];
+            [[unroll]] for (uint i = 0; i < C_ROWS; ++i) {
+                uint sRow = lM * (C_ROWS * warp.y + i);
+                coopMatLoad(matA[i], As, sRow * SA + kk / EPU_A, SA,
+                            gl_CooperativeMatrixLayoutRowMajor);
+            }
+            [[unroll]] for (uint j = 0; j < C_COLS; ++j) {
+                coopmat<B_T, gl_ScopeSubgroup, lK, lN, gl_MatrixUseB> matB;
+                uint sCol = lN * (C_COLS * warp.x + j);
+                coopMatLoad(matB, Bs, kk * SB + sCol / EPU_B, SB,
+                            gl_CooperativeMatrixLayoutRowMajor);
+                [[unroll]] for (uint i = 0; i < C_ROWS; ++i)
+                    acc[i][j] = MMA(matA[i], matB, acc[i][j]);
+            }
+        }
+    }
+
+    [[unroll]] for (uint i = 0; i < C_ROWS; ++i) {
+        uint gi = rowBase + lM * (C_ROWS * warp.y + i);
+        [[unroll]] for (uint j = 0; j < C_COLS; ++j) {
+            uint gj = colBase + lN * (C_COLS * warp.x + j);
+            coopMatStore(acc[i][j], d, gi * N + gj, N, gl_CooperativeMatrixLayoutRowMajor);
+        }
+    }
+}
