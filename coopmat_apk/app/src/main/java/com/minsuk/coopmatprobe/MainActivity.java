@@ -68,6 +68,8 @@ public class MainActivity extends Activity {
     private final CheckBox[] pathBoxes = new CheckBox[PATHS.length];
 
     private LinearLayout results;
+    private LinearLayout blockedBox;
+    private TextView blockedText;
     private TextView status;
     private TextView liveLog;
     private Button runBtn, copyBtn;
@@ -97,7 +99,7 @@ public class MainActivity extends Activity {
         LinearLayout btns = new LinearLayout(this);
         btns.setOrientation(LinearLayout.HORIZONTAL);
         runBtn = button("측정 시작");
-        runBtn.setOnClickListener(v -> start());
+        runBtn.setOnClickListener(v -> start(null));
         copyBtn = button("리포트 복사");
         copyBtn.setEnabled(false);
         copyBtn.setOnClickListener(v -> copyReport());
@@ -123,6 +125,21 @@ public class MainActivity extends Activity {
         phs.addView(paths);
         root.addView(phs);
 
+        blockedBox = vbox();
+        blockedBox.setPadding(0, dp(6), 0, 0);
+        blockedText = text("", 11, ACCENT_I, false);
+        blockedBox.addView(blockedText);
+        TextView clearBlocked = text("자동 건너뛰기 목록 초기화", 12, ACCENT_F, false);
+        clearBlocked.setPadding(0, dp(4), 0, 0);
+        clearBlocked.setOnClickListener(v -> {
+            if (running) return;
+            saveList("blocked", new ArrayList<>());
+            refreshBlockedView();
+            Toast.makeText(this, "초기화했습니다. 다음 측정에서 해당 경로를 다시 시도합니다 (폰이 멈출 수 있음).", Toast.LENGTH_LONG).show();
+        });
+        blockedBox.addView(clearBlocked);
+        root.addView(blockedBox);
+
         status = text("버튼을 누르면 장치 정보를 읽고 지원되는 모든 subgroup 설정을 2048³으로 측정합니다. "
                 + "설정 수에 따라 수십 초 걸릴 수 있습니다.", 13, MUTED, false);
         status.setPadding(0, dp(12), 0, dp(8));
@@ -137,6 +154,7 @@ public class MainActivity extends Activity {
         root.addView(liveLog);
 
         setContentView(scroll);
+        refreshBlockedView();
         showPreviousCrash();
     }
 
@@ -163,36 +181,169 @@ public class MainActivity extends Activity {
         catch (Exception e) { return "?"; }
     }
 
-    /** The whole app died last time (e.g. the phone reset): show where it stopped. */
+    // ---------------------------------------------------- persistent skip lists
+    //
+    // "blocked": (config, path) pairs that froze the phone or hit a GPU timeout.
+    //   They are kept across runs and reboots and always skipped on this device,
+    //   because running them again can take the whole phone down.
+    // "runCrashes": skip records of the current run (crash / hang -> one tiling),
+    //   kept so that a run can be resumed after the phone resets.
+
+    private android.content.SharedPreferences prefs() {
+        return getSharedPreferences("coopmat", Context.MODE_PRIVATE);
+    }
+
+    private List<String> loadList(String key) {
+        List<String> out = new ArrayList<>();
+        String s = prefs().getString(key, "");
+        for (String line : s.split("\n")) if (!line.trim().isEmpty()) out.add(line);
+        return out;
+    }
+
+    private void saveList(String key, List<String> list) {
+        prefs().edit().putString(key, String.join("\n", list)).commit();   // commit: survive a reset
+    }
+
+    private static String recKey(String rec) {          // "C\tcfg\ttarget\t..." -> "cfg\ttarget"
+        String[] f = rec.split("\t", 4);
+        return f.length >= 3 ? f[1] + "\t" + f[2] : rec;
+    }
+
+    private boolean addUnique(List<String> list, String rec) {
+        for (String r : list) if (recKey(r).equals(recKey(rec))) return false;
+        list.add(rec);
+        return true;
+    }
+
+    private void refreshBlockedView() {
+        List<String> b = loadList("blocked");
+        if (b.isEmpty()) { blockedBox.setVisibility(View.GONE); return; }
+        blockedBox.setVisibility(View.VISIBLE);
+        StringBuilder sb = new StringBuilder("이 폰에서 자동으로 건너뛰는 항목 " + b.size() + "개 (폰 멈춤 / GPU timeout 이력)");
+        for (String r : b) {
+            String[] f = r.split("\t", 4);
+            if (f.length >= 3) sb.append("\n  • ").append(f[1]).append(" / ").append(f[2].replace("direct", "no LDS"));
+        }
+        blockedText.setText(sb.toString());
+    }
+
+    // ------------------------------------------------------ breadcrumb parsing
+
+    /** Where the last attempt recorded in progress.log was when it stopped. */
+    private static final class Crumb {
+        String cfg, var, tile, step = "", stepDetail = "";
+        boolean gpuTimeout;
+        int mask = -1;
+        final Map<String, String> done = new LinkedHashMap<>();
+
+        String where() {
+            String s = step;
+            if (!stepDetail.isEmpty()) s = (s.isEmpty() ? "" : s + "  ") + "[" + stepDetail.substring(5).trim() + "]";
+            return cfg == null ? "(벤치마크 시작 단계)"
+                    : cfg + (var != null ? " / " + var : "") + (tile != null ? " / tiling #" + tile : "")
+                      + (s.isEmpty() ? "" : "\n      " + s);
+        }
+
+        String stepText() {
+            return (step + (stepDetail.isEmpty() ? "" : " [" + stepDetail.substring(5).trim() + "]")).replace('\t', ' ');
+        }
+    }
+
+    private static Crumb parseTrace(List<String> trace) {
+        Crumb c = new Crumb();
+        for (String s : trace) {
+            if (s.startsWith("#ENTRY\t")) {
+                String[] f = s.split("\t", 3);
+                if (f.length == 3) c.done.put(f[1], f[2]);
+            } else if (s.startsWith("#RUN-START")) {
+                int i = s.indexOf("paths mask ");
+                if (i >= 0) try { c.mask = Integer.parseInt(s.substring(i + 11).trim()); } catch (NumberFormatException ignored) { }
+            } else if (s.startsWith("#ATTEMPT")) {
+                c.cfg = null; c.var = null; c.tile = null; c.step = ""; c.stepDetail = ""; c.gpuTimeout = false;
+            } else if (s.startsWith("  . #CFG ")) {
+                c.cfg = s.substring(9).trim(); c.var = null; c.tile = null; c.step = ""; c.stepDetail = "";
+            } else if (s.startsWith("  . #VAR ")) {
+                c.var = s.substring(9).trim(); c.tile = null; c.step = ""; c.stepDetail = "";
+            } else if (s.startsWith("  . #TILE ")) {
+                c.tile = s.substring(10).trim(); c.step = ""; c.stepDetail = "";
+            } else if (s.startsWith("  . !!")) {
+                c.gpuTimeout = true;                          // native exited on a GPU job timeout
+            } else if (s.startsWith("  . ") && !s.startsWith("  .   ->")) {
+                String t = s.substring(4).trim();
+                if (t.startsWith("step:")) {
+                    c.stepDetail = t;                         // e.g. "step: run (probe 1x1 WG, K=64)"
+                } else {
+                    if (t.contains("final run")) c.tile = null;   // past the tuning sweep
+                    c.step = t;                               // kernel / path / tiling line
+                    c.stepDetail = "";
+                }
+            }
+        }
+        if (c.cfg != null && c.done.containsKey(c.cfg)) c.cfg = null;   // stopped after finishing it
+        return c;
+    }
+
+    /** The app or the whole phone went down last time: block that path, offer to resume. */
     private void showPreviousCrash() {
         List<String> all = readTrace();
         if (all.isEmpty() || BenchService.END_MARK.equals(all.get(all.size() - 1))) return;
+        final Crumb cr = parseTrace(all);
+
+        boolean newlyBlocked = false;
+        if (cr.cfg != null) {
+            List<String> blocked = loadList("blocked");
+            newlyBlocked = addUnique(blocked, "C\t" + cr.cfg + "\t" + (cr.var != null ? cr.var : "*")
+                    + "\tphone froze / app killed: " + cr.stepText());
+            if (newlyBlocked) saveList("blocked", blocked);
+            refreshBlockedView();
+        }
+
         List<String> lines = new ArrayList<>();
         for (String s : all) if (!s.startsWith("#ENTRY")) lines.add(s);
-
         int from = Math.max(0, lines.size() - 25);
         StringBuilder tail = new StringBuilder();
         if (from > 0) tail.append(lines.get(0)).append("\n…\n");
         for (int i = from; i < lines.size(); i++) tail.append(lines.get(i)).append('\n');
-        final String text = tail.toString().trim();
+        final String text = "멈춘 위치: " + cr.where() + "\n\n" + tail.toString().trim();
 
         LinearLayout c = card("⚠ 이전 측정이 끝나지 않고 종료됨");
-        c.addView(text("앱 전체가 종료되었거나 폰이 재시작된 것 같습니다. 마지막으로 실행 중이던 단계(맨 아래 줄)가 원인일 가능성이 큽니다. "
-                + "문제가 된 경로의 체크를 끄고 다시 측정할 수 있습니다.", 12, BAD, false));
+        c.addView(text("측정 중 폰이 멈췄거나(재부팅 포함) 앱이 강제 종료되었습니다.\n멈춘 위치: " + cr.where()
+                + (cr.cfg != null ? "\n\n이 경로" + (cr.var != null ? " (" + cr.cfg + " / " + cr.var.replace("direct", "no LDS") + ")" : "")
+                    + "는 이 폰에서 앞으로 자동으로 건너뜁니다." : ""), 12, BAD, false));
         TextView lt = text(text, 10, MUTED, false);
         lt.setTypeface(Typeface.MONOSPACE);
         lt.setTextIsSelectable(true);
         lt.setPadding(0, dp(8), 0, dp(8));
+        lt.setVisibility(View.GONE);
+        TextView toggle = text("로그 펼치기 ▾", 13, ACCENT_F, false);
+        toggle.setPadding(0, dp(8), 0, 0);
+        toggle.setOnClickListener(v -> {
+            boolean show = lt.getVisibility() != View.VISIBLE;
+            lt.setVisibility(show ? View.VISIBLE : View.GONE);
+            toggle.setText(show ? "로그 접기 ▴" : "로그 펼치기 ▾");
+        });
+        c.addView(toggle);
         HorizontalScrollView hs = new HorizontalScrollView(this);
         hs.addView(lt);
         c.addView(hs);
-        Button cp = button("이 로그 복사");
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        if (!cr.done.isEmpty() || cr.cfg != null) {
+            Button resume = button("이어서 측정 (완료 " + cr.done.size() + "개 유지)");
+            resume.setOnClickListener(v -> start(cr));
+            row.addView(resume, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+            View gap = new View(this);
+            row.addView(gap, new LinearLayout.LayoutParams(dp(8), 1));
+        }
+        Button cp = button("로그 복사");
         cp.setOnClickListener(v -> {
             ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
             cm.setPrimaryClip(ClipData.newPlainText("coopmat crash log", text));
             Toast.makeText(this, "복사했습니다", Toast.LENGTH_SHORT).show();
         });
-        c.addView(cp);
+        row.addView(cp, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        c.addView(row);
         results.addView(c);
     }
 
@@ -205,7 +356,7 @@ public class MainActivity extends Activity {
 
     private int runMask;
     private int attempt;
-    private final List<String> crashes = new ArrayList<>();          // "C\tkey\tvariant\tstep"
+    private final List<String> crashes = new ArrayList<>();          // "C\tkey\ttarget\treason"
     private final Map<String, String> doneEntries = new LinkedHashMap<>();
     private ServiceConnection conn;
     private boolean finished;
@@ -241,10 +392,15 @@ public class MainActivity extends Activity {
         return true;
     }));
 
-    private void start() {
+    /** @param resumeFrom null for a fresh run, or the breadcrumb of a run to continue. */
+    private void start(Crumb resumeFrom) {
         if (running) return;
         int m = 0;
         for (int i = 0; i < pathBoxes.length; i++) if (pathBoxes[i].isChecked()) m |= 1 << i;
+        if (resumeFrom != null && resumeFrom.mask > 0) {
+            m = resumeFrom.mask;
+            for (int i = 0; i < pathBoxes.length; i++) pathBoxes[i].setChecked((m & (1 << i)) != 0);
+        }
         if (m == 0) {
             Toast.makeText(this, "측정할 경로를 하나 이상 선택하세요", Toast.LENGTH_SHORT).show();
             return;
@@ -253,13 +409,24 @@ public class MainActivity extends Activity {
         attempt = 0;
         crashes.clear();
         doneEntries.clear();
+        crashes.addAll(loadList("blocked"));
+        if (resumeFrom != null) {
+            doneEntries.putAll(resumeFrom.done);
+            for (String r : loadList("runCrashes")) addUnique(crashes, r);
+        } else {
+            saveList("runCrashes", new ArrayList<>());
+        }
         running = true;
         for (CheckBox cb : pathBoxes) cb.setEnabled(false);
         runBtn.setEnabled(false);
         copyBtn.setEnabled(false);
         results.removeAllViews();
         logBuf.setLength(0);
-        liveLog.setText("");
+        if (!crashes.isEmpty())
+            logBuf.append("(건너뛰는 항목 ").append(crashes.size()).append("개: 이전 crash / 폰 멈춤 이력)\n");
+        if (!doneEntries.isEmpty())
+            logBuf.append("(이전 측정에서 끝난 설정 ").append(doneEntries.size()).append("개는 다시 돌리지 않음)\n");
+        liveLog.setText(logBuf);
         liveLog.setVisibility(View.VISIBLE);
         status.setText("실행 중…");
         status.setTextColor(ACCENT_F);
@@ -333,64 +500,48 @@ public class MainActivity extends Activity {
             return;
         }
 
-        // Everything finished so far (also covers messages lost in the crash), and
-        // the last config / path / tiling / step of the attempt that died.
-        String cfg = null, var = null, tile = null, step = "", stepDetail = "";
-        boolean gpuTimeout = false;
-        for (String s : trace) {
-            if (s.startsWith("#ENTRY\t")) {
-                String[] f = s.split("\t", 3);
-                if (f.length == 3) doneEntries.put(f[1], f[2]);
-            } else if (s.startsWith("#ATTEMPT")) {
-                cfg = null; var = null; tile = null; step = ""; stepDetail = ""; gpuTimeout = false;
-            } else if (s.startsWith("  . #CFG ")) {
-                cfg = s.substring(9).trim(); var = null; tile = null; step = ""; stepDetail = "";
-            } else if (s.startsWith("  . #VAR ")) {
-                var = s.substring(9).trim(); tile = null; step = ""; stepDetail = "";
-            } else if (s.startsWith("  . #TILE ")) {
-                tile = s.substring(10).trim(); step = ""; stepDetail = "";
-            } else if (s.startsWith("  . !!")) {
-                gpuTimeout = true;                            // native exited on a GPU job timeout
-            } else if (s.startsWith("  . ") && !s.startsWith("  .   ->")) {
-                String t = s.substring(4).trim();
-                if (t.startsWith("step:")) {
-                    stepDetail = t;                           // e.g. "step: run (1/32 probe)"
-                } else {
-                    if (t.contains("final run")) tile = null; // past the tuning sweep
-                    step = t;                                 // kernel / path / tiling line
-                    stepDetail = "";
-                }
-            }
-        }
-        if (cfg != null && doneEntries.containsKey(cfg)) cfg = null;   // died after finishing it
-        if (!stepDetail.isEmpty()) step = (step.isEmpty() ? "" : step + "  ") + "[" + stepDetail.substring(5).trim() + "]";
+        Crumb cr = parseTrace(trace);
+        doneEntries.putAll(cr.done);   // also covers messages lost in the crash
+        String cfg = cr.cfg, var = cr.var, tile = cr.tile;
+        boolean gpuTimeout = cr.gpuTimeout;
 
         String what = gpuTimeout ? "GPU 작업이 4초 안에 끝나지 않음 → 측정 프로세스를 종료해 GPU 작업 강제 중단 (매우 느리거나 멈춘 커널"
                 : wasHang ? "응답 없음 " + (WATCHDOG_MS / 1000) + "초 → 강제 종료 (GPU/드라이버 hang 추정"
                 : "측정 프로세스가 종료됨 (GPU 드라이버 crash 추정";
-        String where = cfg == null ? "(벤치마크 시작 단계)"
-                : cfg + (var != null ? " / " + var : "") + (tile != null ? " / tiling #" + tile : "")
-                  + (step.isEmpty() ? "" : "\n      " + step);
+        String where = cr.where();
         logBuf.append("\n!!! ").append(what).append(", 시도 ").append(attempt).append(")\n    위치: ").append(where).append('\n');
         liveLog.setText(logBuf);
 
-        // Skip just that tiling the first time; if the same path fails again, skip the whole path.
+        // A GPU timeout or hang can take the whole phone down if repeated: skip the
+        // whole path and remember it for this device. A plain crash skips only that
+        // tiling the first time, and the whole path if the same path fails again.
+        boolean dangerous = gpuTimeout || wasHang;
         String target = var == null ? "*" : var;
-        if (var != null && tile != null) {
+        if (!dangerous && var != null && tile != null) {
             boolean pathFailedBefore = false;
             for (String c : crashes) if (c.startsWith("C\t" + cfg + "\t" + var + "|")) pathFailedBefore = true;
             if (!pathFailedBefore) target = var + "|" + tile;
         }
-        String rec = cfg == null ? null : "C\t" + cfg + "\t" + target + "\t" + (gpuTimeout ? "GPU timeout: " : wasHang ? "hang: " : "crash: ") + step.replace('\t', ' ');
+        String rec = cfg == null ? null : "C\t" + cfg + "\t" + target + "\t"
+                + (gpuTimeout ? "GPU timeout: " : wasHang ? "hang: " : "crash: ") + cr.stepText();
         boolean repeat = false;
-        if (rec != null) for (String c : crashes) if (c.startsWith("C\t" + cfg + "\t" + target + "\t")) repeat = true;
+        if (rec != null) for (String c : crashes) if (recKey(c).equals(recKey(rec))) repeat = true;
         if (rec == null || repeat || attempt >= MAX_ATTEMPTS) {
             logBuf.append("    더 이상 건너뛸 수 없어 중단합니다.\n");
             onDone("{\"error\":\"측정 프로세스가 반복해서 멈추거나 종료되었습니다. 위치: " + where.replace("\"", "'").replace("\n", " ") + "\"}");
             return;
         }
         crashes.add(rec);
+        List<String> rc = loadList("runCrashes");
+        addUnique(rc, rec);
+        saveList("runCrashes", rc);
+        if (dangerous) {
+            List<String> b = loadList("blocked");
+            if (addUnique(b, rec)) saveList("blocked", b);
+            refreshBlockedView();
+        }
         logBuf.append(target.contains("|") ? "    이 tiling만 건너뛰고 이어서 측정합니다…\n"
+                : dangerous ? "    이 경로는 이 폰에서 앞으로 자동으로 건너뜁니다. 이어서 측정합니다…\n"
                 : "    이 경로를 건너뛰고 이어서 측정합니다…\n");
         liveLog.setText(logBuf);
         status.setText("측정 프로세스 재시작 중 (시도 " + (attempt + 1) + ")");

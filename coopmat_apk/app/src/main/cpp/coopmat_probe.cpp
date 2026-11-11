@@ -1301,6 +1301,7 @@ std::string run(AAssetManager *am, Log &log, uint32_t variantMask, const Resume 
         auto done = resume.done.find(key);
         if (done != resume.done.end()) {
             log.line("      (measured in an earlier attempt)");
+            log.entry(key, done->second);   // keep it in progress.log in case this attempt dies too
             bench[i] = done->second;
             continue;
         }

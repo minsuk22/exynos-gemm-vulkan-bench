@@ -68,6 +68,14 @@ Results are shown on screen, written to logcat (tag `COOPMAT`), and saved to
   - starts a new attempt that marks that path as FAIL ("crashed the app") and
     reuses every config already finished.
   - stops after 20 attempts, or if the same spot crashes twice.
+- **Device-level skip list** (v1.6): on one phone, a GPU hang in fp32 no-LDS
+  blanked the screen and needed a reboot. When the app next starts, it reads
+  the unfinished `progress.log` and adds that (config, path) to a skip list
+  kept in SharedPreferences, so it is never run on that phone again. It then
+  offers **이어서 측정** (resume): configs already finished are kept, and the
+  run continues from where it stopped. A GPU timeout or watchdog kill during a
+  run also adds the whole path to this list. The list is shown under the
+  checkboxes and can be cleared there.
 - **Hang watchdog** (v1.4): a step that never returns, such as a shader compile
   or GPU job stuck inside the driver, sends no more progress. If the bench
   process is silent for 30 s, the UI kills it, and the same recovery path takes
