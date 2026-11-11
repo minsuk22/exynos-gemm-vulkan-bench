@@ -54,11 +54,18 @@ Results are shown on screen, written to logcat (tag `COOPMAT`), and saved to
   - A dispatch that takes over 1 s stops that tiling.
   - A fence that doesn't signal within 8 s marks the device as lost. Every
     later step is skipped, and nothing the GPU might still be using is freed.
-- **Crash breadcrumb**: every progress line, and the kernel/path/tiling about to
-  run, is appended and fsync'ed to `files/progress.log`. If a run never reaches
-  its end mark, the next launch shows the tail of that file, i.e. what was
-  running when it died. The checkboxes under the buttons turn individual paths
-  off, so a bad path can be isolated.
+- **Crash isolation** (v1.3): the benchmark runs in `BenchService`, in its own
+  process (`:bench`). If the Vulkan driver kills that process (a shader
+  compiler crash, or an abort after a GPU fault), the UI stays up. It then:
+  - reads `files/progress.log` to find the config, path and step that were
+    running. Every progress line, and each kernel/path/tiling about to run, is
+    fsync'ed there first.
+  - starts a new attempt that marks that path as FAIL ("crashed the app") and
+    reuses every config already finished.
+  - stops after 12 attempts, or if the same spot crashes twice.
+- **Leftover log**: if the whole app or phone goes down, the next launch shows
+  the tail of `progress.log`. The checkboxes under the buttons turn individual
+  paths off.
 - **Check**: inputs are random values from {-1,0,1} (or {0,1,2} for unsigned
   types). Every format holds these exactly, and every partial sum is a small
   integer. 64 outputs (two corners plus 62 random) are compared against a CPU

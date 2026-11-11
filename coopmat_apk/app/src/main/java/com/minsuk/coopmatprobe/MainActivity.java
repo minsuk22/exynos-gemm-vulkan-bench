@@ -3,12 +3,21 @@ package com.minsuk.coopmatprobe;
 import android.app.Activity;
 import android.content.ClipData;
 import android.content.ClipboardManager;
+import android.content.ComponentName;
 import android.content.Context;
+import android.content.Intent;
+import android.content.ServiceConnection;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.GradientDrawable;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.IBinder;
+import android.os.Looper;
+import android.os.Message;
+import android.os.Messenger;
+import android.os.RemoteException;
 import android.util.Log;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -40,7 +49,6 @@ import java.util.Locale;
 import java.util.Map;
 
 public class MainActivity extends Activity {
-    static { System.loadLibrary("coopmat_probe"); }
 
     private static final String TAG = "COOPMAT";
 
@@ -54,14 +62,10 @@ public class MainActivity extends Activity {
     private static final int OK = 0xFF81C784;
     private static final int BAD = 0xFFE57373;
 
-    private native String nativeRun(Object assetManager, int variantMask);
 
     // Same order as kVariants in coopmat_probe.cpp (bit i = path i).
     private static final String[] PATHS = { "no LDS", "LDS x1", "LDS x2", "LDS x3" };
     private final CheckBox[] pathBoxes = new CheckBox[PATHS.length];
-    private static final String TRACE_FILE = "progress.log";
-    private static final String END_MARK = "#RUN-END";
-    private FileOutputStream trace;   // crash breadcrumb, fsync'ed per line
 
     private LinearLayout results;
     private TextView status;
@@ -138,34 +142,20 @@ public class MainActivity extends Activity {
 
     // -------------------------------------------------- crash breadcrumb file
 
+    private static final int MAX_ATTEMPTS = 12;
+
     private File traceFile() {
-        File dir = getExternalFilesDir(null);
-        if (dir == null) dir = getFilesDir();
-        return new File(dir, TRACE_FILE);
+        return new File(BenchService.dir(this), BenchService.TRACE_FILE);
     }
 
-    private synchronized void traceLine(String s) {
-        if (trace == null) return;
-        try {
-            trace.write((s + "\n").getBytes(StandardCharsets.UTF_8));
-            trace.getFD().sync();   // survive an app kill or a phone reset
+    private List<String> readTrace() {
+        List<String> lines = new ArrayList<>();
+        try (java.io.BufferedReader r = new java.io.BufferedReader(
+                new java.io.InputStreamReader(new java.io.FileInputStream(traceFile()), StandardCharsets.UTF_8))) {
+            String s;
+            while ((s = r.readLine()) != null) lines.add(s);
         } catch (Exception ignored) { }
-    }
-
-    private synchronized void traceOpen(int mask) {
-        try {
-            trace = new FileOutputStream(traceFile(), false);
-        } catch (Exception e) {
-            trace = null;
-        }
-        traceLine("#RUN-START " + new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(new Date())
-                + "  " + Build.MANUFACTURER + " " + Build.MODEL + "  app " + appVersion() + "  paths mask " + mask);
-    }
-
-    private synchronized void traceClose() {
-        traceLine(END_MARK);
-        try { if (trace != null) trace.close(); } catch (Exception ignored) { }
-        trace = null;
+        return lines;
     }
 
     private String appVersion() {
@@ -173,19 +163,12 @@ public class MainActivity extends Activity {
         catch (Exception e) { return "?"; }
     }
 
-    /** If the last run never reached its end mark, show where it stopped. */
+    /** The whole app died last time (e.g. the phone reset): show where it stopped. */
     private void showPreviousCrash() {
-        File f = traceFile();
-        if (!f.exists() || f.length() == 0) return;
+        List<String> all = readTrace();
+        if (all.isEmpty() || BenchService.END_MARK.equals(all.get(all.size() - 1))) return;
         List<String> lines = new ArrayList<>();
-        try (java.io.BufferedReader r = new java.io.BufferedReader(
-                new java.io.InputStreamReader(new java.io.FileInputStream(f), StandardCharsets.UTF_8))) {
-            String s;
-            while ((s = r.readLine()) != null) lines.add(s);
-        } catch (Exception e) {
-            return;
-        }
-        if (lines.isEmpty() || END_MARK.equals(lines.get(lines.size() - 1))) return;
+        for (String s : all) if (!s.startsWith("#ENTRY")) lines.add(s);
 
         int from = Math.max(0, lines.size() - 25);
         StringBuilder tail = new StringBuilder();
@@ -194,7 +177,7 @@ public class MainActivity extends Activity {
         final String text = tail.toString().trim();
 
         LinearLayout c = card("⚠ 이전 측정이 끝나지 않고 종료됨");
-        c.addView(text("앱이 강제 종료되었거나 GPU가 멈춘 것 같습니다. 마지막으로 실행 중이던 단계(맨 아래 줄)가 원인일 가능성이 큽니다. "
+        c.addView(text("앱 전체가 종료되었거나 폰이 재시작된 것 같습니다. 마지막으로 실행 중이던 단계(맨 아래 줄)가 원인일 가능성이 큽니다. "
                 + "문제가 된 경로의 체크를 끄고 다시 측정할 수 있습니다.", 12, BAD, false));
         TextView lt = text(text, 10, MUTED, false);
         lt.setTypeface(Typeface.MONOSPACE);
@@ -214,6 +197,45 @@ public class MainActivity extends Activity {
     }
 
     // ------------------------------------------------------------------ run
+    //
+    // The benchmark runs in BenchService's own process. If the GPU driver kills
+    // that process, onServiceDisconnected fires here; we read progress.log to
+    // find the (config, path) that was running, then start a new attempt that
+    // skips it and reuses every config already finished.
+
+    private int runMask;
+    private int attempt;
+    private final List<String> crashes = new ArrayList<>();          // "C\tkey\tvariant\tstep"
+    private final Map<String, String> doneEntries = new LinkedHashMap<>();
+    private ServiceConnection conn;
+    private boolean finished;
+    private volatile String curConfig = "";
+
+    private final Messenger inbox = new Messenger(new Handler(Looper.getMainLooper(), m -> {
+        Bundle d = m.getData();
+        String a = d.getString("a", "");
+        switch (m.what) {
+            case BenchService.MSG_PROGRESS:
+                logBuf.append(a).append('\n');
+                liveLog.setText(logBuf);
+                if (a.startsWith("[")) { curConfig = a.trim(); status.setText("측정 중  " + curConfig); }
+                break;
+            case BenchService.MSG_TRACE:
+                if (!a.startsWith("#") && !a.startsWith("  ->"))
+                    status.setText("측정 중  " + curConfig + "\n" + a);
+                break;
+            case BenchService.MSG_ENTRY:
+                doneEntries.put(a, d.getString("b", ""));
+                break;
+            case BenchService.MSG_DONE:
+                if (finished) break;   // already handled via onBenchDied (process exit won the race)
+                finished = true;
+                stopService();
+                onDone(readFile(a));
+                break;
+        }
+        return true;
+    }));
 
     private void start() {
         if (running) return;
@@ -223,10 +245,12 @@ public class MainActivity extends Activity {
             Toast.makeText(this, "측정할 경로를 하나 이상 선택하세요", Toast.LENGTH_SHORT).show();
             return;
         }
-        final int mask = m;
+        runMask = m;
+        attempt = 0;
+        crashes.clear();
+        doneEntries.clear();
         running = true;
         for (CheckBox cb : pathBoxes) cb.setEnabled(false);
-        traceOpen(mask);
         runBtn.setEnabled(false);
         copyBtn.setEnabled(false);
         results.removeAllViews();
@@ -236,42 +260,123 @@ public class MainActivity extends Activity {
         status.setText("실행 중…");
         status.setTextColor(ACCENT_F);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        launchAttempt();
+    }
 
-        new Thread(() -> {
-            String json;
-            try {
-                json = nativeRun(getAssets(), mask);
-            } catch (Throwable t) {
-                json = "{\"error\":\"" + t.toString().replace("\"", "'") + "\"}";
+    private void launchAttempt() {
+        attempt++;
+        finished = false;
+        final int thisAttempt = attempt;
+        conn = new ServiceConnection() {
+            @Override
+            public void onServiceConnected(ComponentName name, IBinder service) {
+                Message msg = Message.obtain(null, BenchService.MSG_START, runMask, thisAttempt);
+                msg.replyTo = inbox;
+                Bundle b = new Bundle();
+                b.putString("resume", resumeSpec());
+                b.putString("version", appVersion());
+                msg.setData(b);
+                try {
+                    new Messenger(service).send(msg);
+                } catch (RemoteException e) {
+                    onBenchDied();
+                }
             }
-            final String out = json;
-            runOnUiThread(() -> onDone(out));
-        }, "coopmat-bench").start();
+
+            @Override
+            public void onServiceDisconnected(ComponentName name) {
+                if (!finished) onBenchDied();
+            }
+        };
+        if (!bindService(new Intent(this, BenchService.class), conn, Context.BIND_AUTO_CREATE)) {
+            conn = null;
+            onDone("{\"error\":\"측정 서비스를 시작하지 못했습니다\"}");
+        }
     }
 
-    /** Called from native code on the benchmark thread. */
-    @SuppressWarnings("unused")
-    public void onNativeProgress(String line) {
-        traceLine(line);
-        runOnUiThread(() -> {
-            logBuf.append(line).append('\n');
-            liveLog.setText(logBuf);
-            if (line.startsWith("[")) { curConfig = line.trim(); status.setText("측정 중  " + curConfig); }
-        });
+    private void stopService() {
+        if (conn != null) {
+            try { unbindService(conn); } catch (Exception ignored) { }
+            conn = null;
+        }
     }
 
-    private volatile String curConfig = "";
+    private String resumeSpec() {
+        StringBuilder sb = new StringBuilder();
+        for (Map.Entry<String, String> e : doneEntries.entrySet())
+            sb.append("D\t").append(e.getKey()).append('\t').append(e.getValue()).append('\n');
+        for (String c : crashes) sb.append(c).append('\n');
+        return sb.toString();
+    }
 
-    /** Called from native code right before each risky GPU step (breadcrumb only). */
-    @SuppressWarnings("unused")
-    public void onNativeTrace(String line) {
-        traceLine("  . " + line);
-        if (line.startsWith("  ->")) return;
-        runOnUiThread(() -> status.setText("측정 중  " + curConfig + "\n" + line));
+    /** The benchmark process died before finishing. Find out where, then retry without it. */
+    private void onBenchDied() {
+        if (finished) return;
+        finished = true;
+        stopService();
+
+        List<String> trace = readTrace();
+        if (!trace.isEmpty() && BenchService.END_MARK.equals(trace.get(trace.size() - 1))) {
+            // The run had finished; the process exit just beat MSG_DONE here.
+            onDone(readFile(new File(BenchService.dir(this), BenchService.RESULT_FILE).getAbsolutePath()));
+            return;
+        }
+
+        // Everything finished so far (also covers messages lost in the crash), and
+        // the last config / path / step of the attempt that died.
+        String cfg = null, var = null, step = "";
+        for (String s : trace) {
+            if (s.startsWith("#ENTRY\t")) {
+                String[] f = s.split("\t", 3);
+                if (f.length == 3) doneEntries.put(f[1], f[2]);
+            } else if (s.startsWith("#ATTEMPT")) {
+                cfg = null; var = null; step = "";
+            } else if (s.startsWith("  . #CFG ")) {
+                cfg = s.substring(9).trim(); var = null; step = "";
+            } else if (s.startsWith("  . #VAR ")) {
+                var = s.substring(9).trim(); step = "";
+            } else if (s.startsWith("  . ") && !s.startsWith("  .   ->")) {
+                step = s.substring(4).trim();
+            }
+        }
+        if (cfg != null && doneEntries.containsKey(cfg)) cfg = null;   // died after finishing it
+
+        String where = cfg == null ? "(벤치마크 시작 단계)" : cfg + (var != null ? " / " + var : "") + (step.isEmpty() ? "" : "\n   " + step);
+        String note = "\n!!! 측정 프로세스가 종료됨 (GPU 드라이버 crash 추정, 시도 " + attempt + ")\n    위치: " + where + "\n";
+        logBuf.append(note);
+        liveLog.setText(logBuf);
+
+        String rec = cfg == null ? null : "C\t" + cfg + "\t" + (var != null ? var : "*") + "\t" + step.replace('\t', ' ');
+        boolean repeat = rec != null && crashes.contains(rec);
+        if (rec == null || repeat || attempt >= MAX_ATTEMPTS) {
+            logBuf.append("    더 이상 건너뛸 수 없어 중단합니다.\n");
+            onDone("{\"error\":\"측정 프로세스가 반복해서 종료되었습니다. 위치: " + where.replace("\"", "'").replace("\n", " ") + "\"}");
+            return;
+        }
+        crashes.add(rec);
+        logBuf.append("    이 경로를 건너뛰고 이어서 측정합니다…\n");
+        liveLog.setText(logBuf);
+        status.setText("측정 프로세스 재시작 중 (시도 " + (attempt + 1) + ")");
+        new Handler(Looper.getMainLooper()).postDelayed(this::launchAttempt, 800);
+    }
+
+    private String readFile(String path) {
+        if (path == null || path.isEmpty()) return "{\"error\":\"결과 파일 없음\"}";
+        try {
+            byte[] b = java.nio.file.Files.readAllBytes(new File(path).toPath());
+            return new String(b, StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            return "{\"error\":\"결과 파일 읽기 실패: " + e.getMessage() + "\"}";
+        }
+    }
+
+    @Override
+    protected void onDestroy() {
+        stopService();
+        super.onDestroy();
     }
 
     private void onDone(String json) {
-        traceClose();
         running = false;
         for (CheckBox cb : pathBoxes) cb.setEnabled(true);
         runBtn.setEnabled(true);
@@ -279,11 +384,15 @@ public class MainActivity extends Activity {
         getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         try {
             JSONObject o = new JSONObject(json);
+            if (attempt > 1 || !o.has("log")) o.put("log", logBuf.toString());   // keep every attempt's log
+            if (!crashes.isEmpty()) o.put("crashes", crashes.size());
+            json = o.toString();
             render(o);
             lastReport = buildReport(o);
             String saved = save(lastReport, json);
             copyBtn.setEnabled(true);
-            status.setText(o.has("error") ? "오류: " + o.optString("error") : "완료. 저장됨: " + saved);
+            String crashNote = crashes.isEmpty() ? "" : "  (드라이버 crash " + crashes.size() + "회: 해당 경로는 FAIL로 표시)";
+            status.setText(o.has("error") ? "오류: " + o.optString("error") : "완료. 저장됨: " + saved + crashNote);
             status.setTextColor(o.has("error") ? BAD : OK);
             liveLog.setVisibility(View.GONE);
             Log.i(TAG, "JSON " + json);

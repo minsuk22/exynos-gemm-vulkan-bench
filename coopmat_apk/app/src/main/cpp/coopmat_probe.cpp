@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -206,6 +207,7 @@ public:
         char b[64]; snprintf(b, sizeof b, "%.6g", v); out_ += b; return *this;
     }
     const std::string &str() const { return out_; }
+    Json &raw(const std::string &s) { key(nullptr); out_ += s; return *this; }   // pre-built JSON value
 
 private:
     void key(const char *k) {
@@ -242,6 +244,7 @@ struct Log {
     jobject cb = nullptr;
     jmethodID mid = nullptr;     // onNativeProgress: visible log line
     jmethodID midTrace = nullptr; // onNativeTrace: crash breadcrumb only (file + status)
+    jmethodID midEntry = nullptr; // onNativeEntry(key, json): one finished config
     std::string text;
 
     void line(const char *fmt, ...) __attribute__((format(printf, 2, 3))) {
@@ -263,6 +266,16 @@ struct Log {
         vsnprintf(buf, sizeof buf, fmt, ap);
         va_end(ap);
         emit(midTrace, buf);
+    }
+
+    void entry(const std::string &key, const std::string &json) {
+        if (env && cb && midEntry) {
+            jstring k = env->NewStringUTF(key.c_str()), v = env->NewStringUTF(json.c_str());
+            env->CallVoidMethod(cb, midEntry, k, v);
+            env->DeleteLocalRef(k);
+            env->DeleteLocalRef(v);
+            if (env->ExceptionCheck()) env->ExceptionClear();
+        }
     }
 
 private:
@@ -548,6 +561,87 @@ struct Entry : Result {           // top-level fields = fastest passing variant
     std::vector<Result> vars;
 };
 
+// ---------------------------------------------------------------------------
+// Crash-recovery state handed in by the Java side. One record per line,
+// tab-separated:
+//   D <configKey> <entry JSON>              config finished in an earlier attempt
+//   C <configKey> <variantId> <last step>   this path killed the process before
+// ---------------------------------------------------------------------------
+struct Resume {
+    std::map<std::string, std::string> done;      // configKey -> entry JSON
+    std::map<std::string, std::string> crashed;   // configKey|variantId -> last step
+};
+
+std::vector<std::string> splitTabs(const std::string &s, size_t maxParts) {
+    std::vector<std::string> out;
+    size_t p = 0;
+    while (out.size() + 1 < maxParts) {
+        size_t q = s.find('\t', p);
+        if (q == std::string::npos) break;
+        out.push_back(s.substr(p, q - p));
+        p = q + 1;
+    }
+    out.push_back(s.substr(p));
+    return out;
+}
+
+Resume parseResume(const std::string &spec) {
+    Resume r;
+    size_t p = 0;
+    while (p < spec.size()) {
+        size_t q = spec.find('\n', p);
+        if (q == std::string::npos) q = spec.size();
+        std::string line = spec.substr(p, q - p);
+        p = q + 1;
+        if (line.size() < 3) continue;
+        if (line[0] == 'D') {
+            auto f = splitTabs(line, 3);
+            if (f.size() == 3) r.done[f[1]] = f[2];
+        } else if (line[0] == 'C') {
+            auto f = splitTabs(line, 4);
+            if (f.size() >= 3) r.crashed[f[1] + "|" + f[2]] = f.size() == 4 ? f[3] : "";
+        }
+    }
+    return r;
+}
+
+std::string configKey(const VkCooperativeMatrixPropertiesKHR &c) {
+    char b[160];
+    snprintf(b, sizeof b, "%s,%s,%s,%s,%ux%ux%u%s", typeName(c.AType).c_str(), typeName(c.BType).c_str(),
+             typeName(c.CType).c_str(), typeName(c.ResultType).c_str(), c.MSize, c.NSize, c.KSize,
+             c.saturatingAccumulation ? ",sat" : "");
+    return b;
+}
+
+std::string entryJson(const Entry &e, const Gpu &g) {
+    const auto &c = e.cfg;
+    const bool isInt = typeInfo(c.CType) && typeInfo(c.CType)->kind != Kind::Float;
+    Json j;
+    j.obj().kv("a", typeName(c.AType)).kv("b", typeName(c.BType))
+        .kv("c", typeName(c.CType)).kv("r", typeName(c.ResultType))
+        .kv("m", c.MSize).kv("n", c.NSize).kv("k", c.KSize).kv("sat", (bool)c.saturatingAccumulation)
+        .kv("status", e.status).kv("reason", e.reason).kv("kernel", e.kernel)
+        .kv("unit", isInt ? "TOPS" : "TFLOPS")
+        .kv("value", e.value).kv("valueBest", e.valueBest)
+        .kv("ms", e.ms).kv("msBest", e.msBest)
+        .kv("check", e.check).kv("maxErr", e.maxErr).kv("tile", e.tileText)
+        .kv("best", e.id).kv("bestLabel", e.label);
+    j.arr("variants");
+    for (const auto &v : e.vars) {
+        j.obj().kv("id", v.id).kv("label", v.label)
+            .kv("status", v.status).kv("reason", v.reason).kv("kernel", v.kernel)
+            .kv("value", v.value).kv("valueBest", v.valueBest)
+            .kv("ms", v.ms).kv("msBest", v.msBest)
+            .kv("check", v.check).kv("maxErr", v.maxErr).kv("tile", v.tileText);
+        j.arr("tune");
+        for (const auto &t : v.tune)
+            j.obj().kv("tile", tileDesc(t.t, c.MSize, c.NSize, g.sgSize)).kv("value", t.tops).kv("note", t.note).endObj();
+        j.endArr().endObj();
+    }
+    j.endArr().endObj();
+    return j.str();
+}
+
 // Reasons this configuration cannot be benchmarked by our kernel/features.
 std::string unsupportedReason(const Gpu &g, const VkCooperativeMatrixPropertiesKHR &c) {
     if (c.CType != c.ResultType) return "C type != Result type (kernel accumulates in place)";
@@ -588,7 +682,8 @@ VkShaderModule loadModule(Gpu &g, AAssetManager *am, const std::string &file, st
     return mod;
 }
 
-void benchEntry(Gpu &g, AAssetManager *am, Log &log, Entry &e, uint32_t variantMask) {
+void benchEntry(Gpu &g, AAssetManager *am, Log &log, Entry &e, uint32_t variantMask,
+                const std::map<std::string, std::string> &crashed, const std::string &cfgKey) {
     const auto &c = e.cfg;
     const TypeInfo &A = *typeInfo(c.AType), &B = *typeInfo(c.BType), &C = *typeInfo(c.CType);
     const uint32_t lM = c.MSize, lN = c.NSize, lK = c.KSize;
@@ -694,8 +789,21 @@ void benchEntry(Gpu &g, AAssetManager *am, Log &log, Entry &e, uint32_t variantM
         res.kernel = base + (v.direct ? "_direct" : "") + ".spv";
         const int mi = v.direct ? 1 : 0;
         if (!(variantMask & (1u << (&v - kVariants)))) { res.reason = "disabled"; done(res); continue; }
+        {
+            auto it = crashed.find(cfgKey + "|" + v.id);
+            if (it != crashed.end()) {
+                res.status = "fail";
+                res.reason = "crashed the app on an earlier attempt (GPU driver), skipped. Last step: " + it->second;
+                done(res);
+                continue;
+            }
+        }
+        log.trace("#VAR %s", v.id);
         if (g.lost) { res.reason = "device lost earlier"; done(res); continue; }
-        if (!mods[mi] && modErr[mi].empty()) mods[mi] = loadModule(g, am, res.kernel, modErr[mi]);
+        if (!mods[mi] && modErr[mi].empty()) {
+            log.trace("%s | create shader module", res.kernel.c_str());
+            mods[mi] = loadModule(g, am, res.kernel, modErr[mi]);
+        }
         if (!mods[mi]) {
             res.status = modErr[mi].rfind("no prebuilt", 0) == 0 ? "skip" : "fail";
             res.reason = modErr[mi];
@@ -765,6 +873,7 @@ void benchEntry(Gpu &g, AAssetManager *am, Log &log, Entry &e, uint32_t variantM
 
         // --- final timed run + check (D cleared so a variant can't pass on a previous one's output) ---
         memset(bD.p, 0, bD.size);
+        log.trace("%s %s | final run | %s", res.kernel.c_str(), v.label, tileDesc(best, lM, lN, g.sgSize).c_str());
         VkResult pr;
         VkPipeline p = makePipeline(g, mods[mi], lM, lN, lK, best, v.stages, pr);
         std::vector<double> ms;
@@ -824,7 +933,7 @@ void benchEntry(Gpu &g, AAssetManager *am, Log &log, Entry &e, uint32_t variantM
 // ---------------------------------------------------------------------------
 // Top level
 // ---------------------------------------------------------------------------
-std::string run(AAssetManager *am, Log &log, uint32_t variantMask) {
+std::string run(AAssetManager *am, Log &log, uint32_t variantMask, const Resume &resume) {
     Json j;
     j.obj();
     j.kv("problem", (int)kSize);
@@ -1126,17 +1235,33 @@ std::string run(AAssetManager *am, Log &log, uint32_t variantMask) {
             if (variantMask & (1u << v)) { if (!on.empty()) on += ", "; on += kVariants[v].label; }
         log.line("=== %ux%ux%u GEMM, one run per configuration; paths: %s ===", kSize, kSize, kSize, on.c_str());
     }
+    // Crash recovery (see BenchService.java): configs already measured in an earlier
+    // attempt are passed back as finished JSON and are not re-run; a (config, path)
+    // that killed the process is marked failed instead of being run again.
+    std::vector<std::string> bench(entries.size());
     for (size_t i = 0; i < entries.size(); ++i) {
         Entry &e = entries[i];
         const auto &c = e.cfg;
         const bool isInt = typeInfo(c.CType) && typeInfo(c.CType)->kind != Kind::Float;
+        const std::string key = configKey(c);
         log.line("[%zu/%zu] %s x %s -> %s  %ux%ux%u%s", i + 1, entries.size(),
                  typeName(c.AType).c_str(), typeName(c.BType).c_str(), typeName(c.ResultType).c_str(),
                  c.MSize, c.NSize, c.KSize, c.saturatingAccumulation ? " sat" : "");
-        if (g.lost) { e.status = "skip"; e.reason = "device lost earlier"; }
+        auto done = resume.done.find(key);
+        if (done != resume.done.end()) {
+            log.line("      (measured in an earlier attempt)");
+            bench[i] = done->second;
+            continue;
+        }
+        log.trace("#CFG %s", key.c_str());
+        auto whole = resume.crashed.find(key + "|*");
+        if (whole != resume.crashed.end()) {
+            e.status = "fail";
+            e.reason = "crashed the app on an earlier attempt (GPU driver), skipped. Last step: " + whole->second;
+        } else if (g.lost) { e.status = "skip"; e.reason = "device lost earlier"; }
         else {
             e.reason = unsupportedReason(g, c);
-            if (e.reason.empty()) benchEntry(g, am, log, e, variantMask);
+            if (e.reason.empty()) benchEntry(g, am, log, e, variantMask, resume.crashed, key);
         }
         if (e.status == "ok")
             log.line("      => best: %s  %.3f %s  check %s", e.label.c_str(), e.value, isInt ? "TOPS" : "TFLOPS",
@@ -1144,35 +1269,12 @@ std::string run(AAssetManager *am, Log &log, uint32_t variantMask) {
         else if (e.vars.empty())
             log.line("      %s: %s%s%s", e.status.c_str(), e.reason.c_str(),
                      e.check.empty() ? "" : "  ", e.check.c_str());
+        bench[i] = entryJson(e, g);
+        if (!g.lost) log.entry(key, bench[i]);   // lets the next attempt skip it
     }
 
     j.arr("bench");
-    for (const auto &e : entries) {
-        const auto &c = e.cfg;
-        const bool isInt = typeInfo(c.CType) && typeInfo(c.CType)->kind != Kind::Float;
-        j.obj().kv("a", typeName(c.AType)).kv("b", typeName(c.BType))
-            .kv("c", typeName(c.CType)).kv("r", typeName(c.ResultType))
-            .kv("m", c.MSize).kv("n", c.NSize).kv("k", c.KSize).kv("sat", (bool)c.saturatingAccumulation)
-            .kv("status", e.status).kv("reason", e.reason).kv("kernel", e.kernel)
-            .kv("unit", isInt ? "TOPS" : "TFLOPS")
-            .kv("value", e.value).kv("valueBest", e.valueBest)
-            .kv("ms", e.ms).kv("msBest", e.msBest)
-            .kv("check", e.check).kv("maxErr", e.maxErr).kv("tile", e.tileText)
-            .kv("best", e.id).kv("bestLabel", e.label);
-        j.arr("variants");
-        for (const auto &v : e.vars) {
-            j.obj().kv("id", v.id).kv("label", v.label)
-                .kv("status", v.status).kv("reason", v.reason).kv("kernel", v.kernel)
-                .kv("value", v.value).kv("valueBest", v.valueBest)
-                .kv("ms", v.ms).kv("msBest", v.msBest)
-                .kv("check", v.check).kv("maxErr", v.maxErr).kv("tile", v.tileText);
-            j.arr("tune");
-            for (const auto &t : v.tune)
-                j.obj().kv("tile", tileDesc(t.t, c.MSize, c.NSize, g.sgSize)).kv("value", t.tops).kv("note", t.note).endObj();
-            j.endArr().endObj();
-        }
-        j.endArr().endObj();
-    }
+    for (const auto &s : bench) j.raw(s);
     j.endArr();
     log.line("");
     log.line("done.");
@@ -1182,16 +1284,27 @@ std::string run(AAssetManager *am, Log &log, uint32_t variantMask) {
 }  // namespace
 
 extern "C" JNIEXPORT jstring JNICALL
-Java_com_minsuk_coopmatprobe_MainActivity_nativeRun(JNIEnv *env, jobject thiz, jobject assetManager, jint variantMask) {
+Java_com_minsuk_coopmatprobe_BenchService_nativeRun(JNIEnv *env, jobject thiz, jobject assetManager,
+                                                    jint variantMask, jstring resumeSpec) {
     Log log;
     log.env = env;
     log.cb = thiz;
     jclass cls = env->GetObjectClass(thiz);
-    log.mid = env->GetMethodID(cls, "onNativeProgress", "(Ljava/lang/String;)V");
-    if (!log.mid) env->ExceptionClear();
-    log.midTrace = env->GetMethodID(cls, "onNativeTrace", "(Ljava/lang/String;)V");
-    if (!log.midTrace) env->ExceptionClear();
+    auto method = [&](const char *name, const char *sig) {
+        jmethodID m = env->GetMethodID(cls, name, sig);
+        if (!m) env->ExceptionClear();
+        return m;
+    };
+    log.mid = method("onNativeProgress", "(Ljava/lang/String;)V");
+    log.midTrace = method("onNativeTrace", "(Ljava/lang/String;)V");
+    log.midEntry = method("onNativeEntry", "(Ljava/lang/String;Ljava/lang/String;)V");
+    Resume resume;
+    if (resumeSpec) {
+        const char *s = env->GetStringUTFChars(resumeSpec, nullptr);
+        resume = parseResume(s ? s : "");
+        if (s) env->ReleaseStringUTFChars(resumeSpec, s);
+    }
     AAssetManager *am = AAssetManager_fromJava(env, assetManager);
-    std::string json = run(am, log, (uint32_t)variantMask);
+    std::string json = run(am, log, (uint32_t)variantMask, resume);
     return env->NewStringUTF(json.c_str());
 }

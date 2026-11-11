@@ -17,6 +17,11 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <!-- Benchmark runs in its own process so a GPU-driver crash can not take the UI down. -->
+        <service
+            android:name=".BenchService"
+            android:exported="false"
+            android:process=":bench" />
     </application>
 
 </manifest>
