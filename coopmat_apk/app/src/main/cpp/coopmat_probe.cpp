@@ -31,17 +31,19 @@
 #include <tuple>
 #include <vector>
 
+#include <unistd.h>
+
 #define TAG "COOPMAT"
 
 namespace {
 
 constexpr uint32_t kSize = 2048;   // M = N = K
 
-// Speed gate: each tiling first runs once at kProbeMN x kProbeMN x kProbeK (1/32 of the
-// work). If that projects to more than kMaxEstMs per 2048^3 dispatch it is skipped, so a
+// Speed gate: each tiling is first run on a reduced problem (kProbeMN^2 x ~64), ramping
+// the grid up; if it projects to more than kMaxEstMs per 2048^3 dispatch it is skipped, so a
 // pathological kernel never holds the GPU for seconds.
-constexpr uint32_t kProbeMN = 1024, kProbeK = 256;
-constexpr double kProbeScale = 32.0;
+constexpr uint32_t kProbeMN = 1024;
+constexpr double kMaxStepMs = 400.0;   // cap on any single probe dispatch (predicted)
 constexpr double kMaxEstMs = 250.0;
 
 // ---------------------------------------------------------------------------
@@ -289,6 +291,7 @@ private:
         }
     }
 };
+Log *gLog = nullptr;   // for the GPU-timeout exit path in runTimed
 
 // ---------------------------------------------------------------------------
 // Vulkan context
@@ -438,7 +441,7 @@ VkPipeline makePipeline(Gpu &g, VkShaderModule mod, uint32_t lM, uint32_t lN, ui
 // longer than kMaxDispatchMs. On a fence timeout the GPU may still be running
 // the work, so g.hung is set and the caller must not free anything it uses.
 constexpr double kMaxDispatchMs = 1000.0;
-constexpr uint64_t kFenceTimeoutNs = 8ull * 1000 * 1000 * 1000;
+constexpr uint64_t kFenceTimeoutNs = 4ull * 1000 * 1000 * 1000;
 
 bool runTimed(Gpu &g, VkPipeline pipe, uint32_t gx, uint32_t gy, uint32_t warmup, uint32_t iters,
               std::vector<double> &ms, std::string &err) {
@@ -481,7 +484,14 @@ bool runTimed(Gpu &g, VkPipeline pipe, uint32_t gx, uint32_t gy, uint32_t warmup
         r = vkWaitForFences(g.dev, 1, &g.fence, VK_TRUE, kFenceTimeoutNs);
         auto t1 = std::chrono::steady_clock::now();
         if (r != VK_SUCCESS) {
-            if (r == VK_TIMEOUT) { err = "GPU timeout (>8 s for one dispatch)"; g.hung = true; }
+            if (r == VK_TIMEOUT) {
+                // The job is still on the GPU. Nothing in-process can cancel it, and while it
+                // runs the display compositor is starved too (the screen freezes). Exiting
+                // makes the kernel driver tear down our context and kill the job; the UI
+                // process sees the exit and restarts the run without this tiling.
+                if (gLog) gLog->trace("!! GPU job did not finish within 4 s: exiting so the driver kills it");
+                _exit(42);
+            }
             else err = "vkWaitForFences=" + std::to_string(r);
             g.lost = true;
             return false;
@@ -836,25 +846,53 @@ void benchEntry(Gpu &g, AAssetManager *am, Log &log, Entry &e, uint32_t variantM
                 log.trace("%s %s | %s", res.kernel.c_str(), v.label, td.c_str());
                 std::string err;
                 std::vector<double> ms;
-                // 1) Gauge speed on 1/32 of the work (1024x1024x256) before committing
-                //    the GPU to full 2048^3 dispatches.
+                // 1) Gauge speed before committing the GPU to full 2048^3 dispatches.
+                //    Probe pipeline: 1024 x 1024 x pk (pk ~ 64). Its grid is ramped
+                //    1 -> 4 -> 16 -> all workgroups; a level runs only if the previous
+                //    one predicts it stays under kMaxStepMs (prediction scales time by
+                //    the workgroup ratio, which over-estimates, so it errs safe). A
+                //    pathological kernel is therefore caught while each dispatch is
+                //    still tiny, instead of one long dispatch freezing the GPU.
+                uint32_t pk = t.bk * std::max(1u, (64u + t.bk - 1) / t.bk);
+                if (kSize % pk) pk = 256;
+                const uint32_t pgx = kProbeMN / TN, pgy = kProbeMN / TM;
                 VkResult pr;
-                log.trace("    step: compile (1/32 probe)");
+                log.trace("    step: compile (probe)");
                 VkPipeline pp = makePipeline(g, mods[mi], lM, lN, lK, t, v.stages, pr,
-                                             kProbeMN, kProbeMN, kProbeK);
+                                             kProbeMN, kProbeMN, pk);
                 if (!pp) tr.note = "pipeline creation failed (" + std::to_string(pr) + ")";
                 else {
-                    log.trace("    step: run (1/32 probe)");
-                    if (!runTimed(g, pp, kProbeMN / TN, kProbeMN / TM, 0, 1, ms, err)) tr.note = "probe: " + err;
-                    else {
-                        double est = ms[0] * kProbeScale;
+                    const uint32_t levels[][2] = { { 1, 1 }, { 2, 2 }, { 4, 4 }, { pgx, pgy } };
+                    double prevMs = 0, prevWg = 0;
+                    for (const auto &lv : levels) {
+                        uint32_t gx = std::min(lv[0], pgx), gy = std::min(lv[1], pgy);
+                        double wg = (double)gx * gy;
+                        if (prevWg > 0) {
+                            if (wg <= prevWg) continue;
+                            double predicted = prevMs * wg / prevWg;
+                            if (predicted > kMaxStepMs) {
+                                char b[128];
+                                snprintf(b, sizeof b, "too slow (%.1f ms for %.0f workgroups x K=%u)", prevMs, prevWg, pk);
+                                tr.note = b;
+                                break;
+                            }
+                        }
+                        char sb[64];
+                        snprintf(sb, sizeof sb, "    step: run (probe %ux%u WG, K=%u)", gx, gy, pk);
+                        log.trace("%s", sb);
+                        if (!runTimed(g, pp, gx, gy, 0, 1, ms, err)) { tr.note = "probe: " + err; break; }
+                        prevMs = ms[0];
+                        prevWg = wg;
+                    }
+                    if (tr.note.empty()) {
+                        double est = prevMs * ((double)kSize * kSize * kSize) / ((double)kProbeMN * kProbeMN * pk);
                         if (est > kMaxEstMs) {
                             char b[96];
                             snprintf(b, sizeof b, "too slow (~%.0f ms est. per 2048^3)", est);
                             tr.note = b;
                         }
                     }
-                    if (!g.hung) vkDestroyPipeline(g.dev, pp, nullptr);
+                    vkDestroyPipeline(g.dev, pp, nullptr);
                 }
                 // 2) Short full-size run.
                 if (tr.note.empty()) {
@@ -946,6 +984,7 @@ void benchEntry(Gpu &g, AAssetManager *am, Log &log, Entry &e, uint32_t variantM
 // Top level
 // ---------------------------------------------------------------------------
 std::string run(AAssetManager *am, Log &log, uint32_t variantMask, const Resume &resume) {
+    gLog = &log;
     Json j;
     j.obj();
     j.kv("problem", (int)kSize);

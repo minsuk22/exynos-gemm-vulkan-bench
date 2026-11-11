@@ -45,15 +45,20 @@ Results are shown on screen, written to logcat (tag `COOPMAT`), and saved to
   before sending the next. The headline number is `2·2048³ / median`.
 - **GPU safety** (added in v1.2 after v1.1 froze a phone partway through a
   run):
-  - Before any full-size dispatch, each tiling runs once at 1024×1024×256
-    (1/32 of the work). If that projects to more than 250 ms per 2048³, the
+  - Before any full-size dispatch, each tiling runs on a probe problem of
+    1024×1024×~64 (v1.5). The grid ramps from 1 to 4 to 16 workgroups, then the
+    whole probe grid. A level runs only if the previous level predicts it stays
+    under 400 ms, so a pathological kernel is caught while its dispatches are
+    still tiny. If the full probe projects to more than 250 ms per 2048³, the
     tiling is skipped as "too slow".
   - With one dispatch per submit, no single submission can hold the GPU for
     long. The display compositor shares the GPU, and the kernel driver resets
     the GPU when a submission runs too long.
   - A dispatch that takes over 1 s stops that tiling.
-  - A fence that doesn't signal within 8 s marks the device as lost. Every
-    later step is skipped, and nothing the GPU might still be using is freed.
+  - If a fence doesn't signal within 4 s, the bench process exits on purpose
+    (v1.5). A job left running on the GPU starves the display compositor and
+    the screen freezes. Process exit is the only way to make the kernel driver
+    kill that job. The UI then restarts the run without that tiling.
 - **Crash isolation** (v1.3): the benchmark runs in `BenchService`, in its own
   process (`:bench`). If the Vulkan driver kills that process (a shader
   compiler crash, or an abort after a GPU fault), the UI stays up. It then:

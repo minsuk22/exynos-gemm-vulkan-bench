@@ -336,18 +336,21 @@ public class MainActivity extends Activity {
         // Everything finished so far (also covers messages lost in the crash), and
         // the last config / path / tiling / step of the attempt that died.
         String cfg = null, var = null, tile = null, step = "", stepDetail = "";
+        boolean gpuTimeout = false;
         for (String s : trace) {
             if (s.startsWith("#ENTRY\t")) {
                 String[] f = s.split("\t", 3);
                 if (f.length == 3) doneEntries.put(f[1], f[2]);
             } else if (s.startsWith("#ATTEMPT")) {
-                cfg = null; var = null; tile = null; step = ""; stepDetail = "";
+                cfg = null; var = null; tile = null; step = ""; stepDetail = ""; gpuTimeout = false;
             } else if (s.startsWith("  . #CFG ")) {
                 cfg = s.substring(9).trim(); var = null; tile = null; step = ""; stepDetail = "";
             } else if (s.startsWith("  . #VAR ")) {
                 var = s.substring(9).trim(); tile = null; step = ""; stepDetail = "";
             } else if (s.startsWith("  . #TILE ")) {
                 tile = s.substring(10).trim(); step = ""; stepDetail = "";
+            } else if (s.startsWith("  . !!")) {
+                gpuTimeout = true;                            // native exited on a GPU job timeout
             } else if (s.startsWith("  . ") && !s.startsWith("  .   ->")) {
                 String t = s.substring(4).trim();
                 if (t.startsWith("step:")) {
@@ -362,8 +365,9 @@ public class MainActivity extends Activity {
         if (cfg != null && doneEntries.containsKey(cfg)) cfg = null;   // died after finishing it
         if (!stepDetail.isEmpty()) step = (step.isEmpty() ? "" : step + "  ") + "[" + stepDetail.substring(5).trim() + "]";
 
-        String what = wasHang ? "응답 없음 " + (WATCHDOG_MS / 1000) + "초 → 강제 종료 (GPU/드라이버 hang 추정"
-                              : "측정 프로세스가 종료됨 (GPU 드라이버 crash 추정";
+        String what = gpuTimeout ? "GPU 작업이 4초 안에 끝나지 않음 → 측정 프로세스를 종료해 GPU 작업 강제 중단 (매우 느리거나 멈춘 커널"
+                : wasHang ? "응답 없음 " + (WATCHDOG_MS / 1000) + "초 → 강제 종료 (GPU/드라이버 hang 추정"
+                : "측정 프로세스가 종료됨 (GPU 드라이버 crash 추정";
         String where = cfg == null ? "(벤치마크 시작 단계)"
                 : cfg + (var != null ? " / " + var : "") + (tile != null ? " / tiling #" + tile : "")
                   + (step.isEmpty() ? "" : "\n      " + step);
@@ -377,7 +381,7 @@ public class MainActivity extends Activity {
             for (String c : crashes) if (c.startsWith("C\t" + cfg + "\t" + var + "|")) pathFailedBefore = true;
             if (!pathFailedBefore) target = var + "|" + tile;
         }
-        String rec = cfg == null ? null : "C\t" + cfg + "\t" + target + "\t" + (wasHang ? "hang: " : "crash: ") + step.replace('\t', ' ');
+        String rec = cfg == null ? null : "C\t" + cfg + "\t" + target + "\t" + (gpuTimeout ? "GPU timeout: " : wasHang ? "hang: " : "crash: ") + step.replace('\t', ' ');
         boolean repeat = false;
         if (rec != null) for (String c : crashes) if (c.startsWith("C\t" + cfg + "\t" + target + "\t")) repeat = true;
         if (rec == null || repeat || attempt >= MAX_ATTEMPTS) {
