@@ -36,6 +36,13 @@ namespace {
 
 constexpr uint32_t kSize = 2048;   // M = N = K
 
+// Speed gate: each tiling first runs once at kProbeMN x kProbeMN x kProbeK (1/32 of the
+// work). If that projects to more than kMaxEstMs per 2048^3 dispatch it is skipped, so a
+// pathological kernel never holds the GPU for seconds.
+constexpr uint32_t kProbeMN = 1024, kProbeK = 256;
+constexpr double kProbeScale = 32.0;
+constexpr double kMaxEstMs = 250.0;
+
 // ---------------------------------------------------------------------------
 // Enums and structs newer than the NDK r28 Vulkan header (VK_HEADER_VERSION 275)
 // ---------------------------------------------------------------------------
@@ -233,7 +240,8 @@ private:
 struct Log {
     JNIEnv *env = nullptr;
     jobject cb = nullptr;
-    jmethodID mid = nullptr;
+    jmethodID mid = nullptr;     // onNativeProgress: visible log line
+    jmethodID midTrace = nullptr; // onNativeTrace: crash breadcrumb only (file + status)
     std::string text;
 
     void line(const char *fmt, ...) __attribute__((format(printf, 2, 3))) {
@@ -244,10 +252,25 @@ struct Log {
         va_end(ap);
         text += buf;
         text += '\n';
+        emit(mid, buf);
+    }
+    // Written (and fsync'ed by the Java side) before each risky GPU step, so a
+    // crash or hang leaves a record of what was running.
+    void trace(const char *fmt, ...) __attribute__((format(printf, 2, 3))) {
+        char buf[512];
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(buf, sizeof buf, fmt, ap);
+        va_end(ap);
+        emit(midTrace, buf);
+    }
+
+private:
+    void emit(jmethodID m, const char *buf) {
         __android_log_print(ANDROID_LOG_INFO, TAG, "%s", buf);
-        if (env && cb && mid) {
+        if (env && cb && m) {
             jstring s = env->NewStringUTF(buf);
-            env->CallVoidMethod(cb, mid, s);
+            env->CallVoidMethod(cb, m, s);
             env->DeleteLocalRef(s);
             if (env->ExceptionCheck()) env->ExceptionClear();
         }
@@ -288,9 +311,10 @@ struct Gpu {
     VkFence fence = VK_NULL_HANDLE;
     VkQueryPool qpool = VK_NULL_HANDLE;
     bool lost = false;
+    bool hung = false;   // a fence timed out: GPU may still be using our resources
 };
 
-constexpr uint32_t kMaxTimed = 32;
+constexpr uint32_t kMaxTimed = 2;   // timestamp queries (one pair per dispatch)
 
 struct Buf {
     VkBuffer b = VK_NULL_HANDLE;
@@ -360,9 +384,10 @@ std::string tileDesc(const Tile &t, uint32_t lM, uint32_t lN, uint32_t sg) {
 }
 
 VkPipeline makePipeline(Gpu &g, VkShaderModule mod, uint32_t lM, uint32_t lN, uint32_t lK,
-                        const Tile &t, uint32_t stages, VkResult &err) {
+                        const Tile &t, uint32_t stages, VkResult &err,
+                        uint32_t pM = kSize, uint32_t pN = kSize, uint32_t pK = kSize) {
     uint32_t local = t.wgW * t.wgH * g.sgSize;
-    uint32_t spec[14] = { lM, lN, lK, kSize, kSize, kSize,
+    uint32_t spec[14] = { lM, lN, lK, pM, pN, pK,
                           t.cRows, t.cCols, t.wgW, t.wgH, t.bk, local,
                           std::max(stages, 1u), local };
     VkSpecializationMapEntry ent[14];
@@ -389,35 +414,36 @@ VkPipeline makePipeline(Gpu &g, VkShaderModule mod, uint32_t lM, uint32_t lN, ui
     return p;
 }
 
-// Runs `warmup` untimed + `iters` timed dispatches in one submit. Fills ms[]
-// with per-dispatch GPU time (consecutive bottom-of-pipe timestamps).
+// Runs `warmup` untimed + `iters` timed dispatches, ONE DISPATCH PER SUBMIT,
+// waiting for each. Keeping every submit to a single dispatch means a slow
+// kernel never holds the GPU for long in one go (the display compositor
+// shares it, and the kernel driver resets the GPU when one submission runs
+// too long). Fills ms[] with per-dispatch GPU time from a timestamp pair
+// around the dispatch.
+//
+// Stops early, returning false with err = "too slow ...", if a dispatch takes
+// longer than kMaxDispatchMs. On a fence timeout the GPU may still be running
+// the work, so g.hung is set and the caller must not free anything it uses.
+constexpr double kMaxDispatchMs = 1000.0;
+constexpr uint64_t kFenceTimeoutNs = 8ull * 1000 * 1000 * 1000;
+
 bool runTimed(Gpu &g, VkPipeline pipe, uint32_t gx, uint32_t gy, uint32_t warmup, uint32_t iters,
               std::vector<double> &ms, std::string &err) {
-    iters = std::min(iters, kMaxTimed - 1);
-    bool useTs = g.tsBits > 0 && g.qpool;
+    ms.clear();
+    if (g.lost) { err = "device lost earlier"; return false; }
+    const bool useTs = g.tsBits > 0 && g.qpool;
 
     vkResetCommandBuffer(g.cmd, 0);
     VkCommandBufferBeginInfo bi{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO };
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(g.cmd, &bi);
-    if (useTs) vkCmdResetQueryPool(g.cmd, g.qpool, 0, kMaxTimed);
+    vkBeginCommandBuffer(g.cmd, &bi);   // re-submitted, so no ONE_TIME_SUBMIT
+    if (useTs) {
+        vkCmdResetQueryPool(g.cmd, g.qpool, 0, 2);
+        vkCmdWriteTimestamp(g.cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, g.qpool, 0);
+    }
     vkCmdBindPipeline(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     vkCmdBindDescriptorSets(g.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, g.layout, 0, 1, &g.set, 0, nullptr);
-
-    VkMemoryBarrier mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
-    mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    mb.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
-    auto barrier = [&] {
-        vkCmdPipelineBarrier(g.cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             0, 1, &mb, 0, nullptr, 0, nullptr);
-    };
-    for (uint32_t i = 0; i < warmup; ++i) { vkCmdDispatch(g.cmd, gx, gy, 1); barrier(); }
-    if (useTs) vkCmdWriteTimestamp(g.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.qpool, 0);
-    for (uint32_t i = 0; i < iters; ++i) {
-        vkCmdDispatch(g.cmd, gx, gy, 1);
-        if (useTs) vkCmdWriteTimestamp(g.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.qpool, i + 1);
-        barrier();
-    }
+    vkCmdDispatch(g.cmd, gx, gy, 1);
+    if (useTs) vkCmdWriteTimestamp(g.cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, g.qpool, 1);
     VkMemoryBarrier hb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER };
     hb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     hb.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
@@ -425,35 +451,43 @@ bool runTimed(Gpu &g, VkPipeline pipe, uint32_t gx, uint32_t gy, uint32_t warmup
                          0, 1, &hb, 0, nullptr, 0, nullptr);
     vkEndCommandBuffer(g.cmd);
 
-    vkResetFences(g.dev, 1, &g.fence);
     VkSubmitInfo sub{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
     sub.commandBufferCount = 1;
     sub.pCommandBuffers = &g.cmd;
-    auto t0 = std::chrono::steady_clock::now();
-    VkResult r = vkQueueSubmit(g.queue, 1, &sub, g.fence);
-    if (r != VK_SUCCESS) { err = "vkQueueSubmit=" + std::to_string(r); if (r == VK_ERROR_DEVICE_LOST) g.lost = true; return false; }
-    r = vkWaitForFences(g.dev, 1, &g.fence, VK_TRUE, 30ull * 1000 * 1000 * 1000);
-    auto t1 = std::chrono::steady_clock::now();
-    if (r != VK_SUCCESS) {
-        err = r == VK_TIMEOUT ? "GPU timeout (>30 s)" : "vkWaitForFences=" + std::to_string(r);
-        g.lost = true;   // a hung queue is not recoverable here
-        return false;
-    }
+    const uint64_t mask = g.tsBits >= 64 ? ~0ull : ((1ull << g.tsBits) - 1);
 
-    ms.clear();
-    if (useTs) {
-        uint64_t ts[kMaxTimed];
-        r = vkGetQueryPoolResults(g.dev, g.qpool, 0, iters + 1, sizeof ts, ts, sizeof(uint64_t),
-                                  VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
-        if (r == VK_SUCCESS) {
-            uint64_t mask = g.tsBits >= 64 ? ~0ull : ((1ull << g.tsBits) - 1);
-            for (uint32_t i = 0; i < iters; ++i)
-                ms.push_back((double)((ts[i + 1] - ts[i]) & mask) * g.props.limits.timestampPeriod * 1e-6);
-            return true;
+    for (uint32_t i = 0; i < warmup + iters; ++i) {
+        vkResetFences(g.dev, 1, &g.fence);
+        auto t0 = std::chrono::steady_clock::now();
+        VkResult r = vkQueueSubmit(g.queue, 1, &sub, g.fence);
+        if (r != VK_SUCCESS) {
+            err = "vkQueueSubmit=" + std::to_string(r);
+            if (r == VK_ERROR_DEVICE_LOST) g.lost = true;
+            return false;
+        }
+        r = vkWaitForFences(g.dev, 1, &g.fence, VK_TRUE, kFenceTimeoutNs);
+        auto t1 = std::chrono::steady_clock::now();
+        if (r != VK_SUCCESS) {
+            if (r == VK_TIMEOUT) { err = "GPU timeout (>8 s for one dispatch)"; g.hung = true; }
+            else err = "vkWaitForFences=" + std::to_string(r);
+            g.lost = true;
+            return false;
+        }
+        double t = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        if (useTs) {
+            uint64_t ts[2];
+            if (vkGetQueryPoolResults(g.dev, g.qpool, 0, 2, sizeof ts, ts, sizeof(uint64_t),
+                                      VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS)
+                t = (double)((ts[1] - ts[0]) & mask) * g.props.limits.timestampPeriod * 1e-6;
+        }
+        if (i >= warmup) ms.push_back(t);
+        if (t > kMaxDispatchMs) {
+            char b[96];
+            snprintf(b, sizeof b, "too slow (%.0f ms per dispatch)", t);
+            err = b;
+            return false;
         }
     }
-    double total = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    for (uint32_t i = 0; i < iters; ++i) ms.push_back(total / (warmup + iters));
     return true;
 }
 
@@ -554,7 +588,7 @@ VkShaderModule loadModule(Gpu &g, AAssetManager *am, const std::string &file, st
     return mod;
 }
 
-void benchEntry(Gpu &g, AAssetManager *am, Log &log, Entry &e) {
+void benchEntry(Gpu &g, AAssetManager *am, Log &log, Entry &e, uint32_t variantMask) {
     const auto &c = e.cfg;
     const TypeInfo &A = *typeInfo(c.AType), &B = *typeInfo(c.BType), &C = *typeInfo(c.CType);
     const uint32_t lM = c.MSize, lN = c.NSize, lK = c.KSize;
@@ -659,6 +693,7 @@ void benchEntry(Gpu &g, AAssetManager *am, Log &log, Entry &e) {
         res.label = v.label;
         res.kernel = base + (v.direct ? "_direct" : "") + ".spv";
         const int mi = v.direct ? 1 : 0;
+        if (!(variantMask & (1u << (&v - kVariants)))) { res.reason = "disabled"; done(res); continue; }
         if (g.lost) { res.reason = "device lost earlier"; done(res); continue; }
         if (!mods[mi] && modErr[mi].empty()) mods[mi] = loadModule(g, am, res.kernel, modErr[mi]);
         if (!mods[mi]) {
@@ -681,18 +716,41 @@ void benchEntry(Gpu &g, AAssetManager *am, Log &log, Entry &e) {
             else if (lds > L.maxComputeSharedMemorySize) tr.note = "LDS " + std::to_string(lds) + " B > limit";
             else if (thr > L.maxComputeWorkGroupInvocations || thr > L.maxComputeWorkGroupSize[0]) tr.note = "too many invocations";
             if (tr.note.empty()) {
+                const std::string td = tileDesc(t, lM, lN, g.sgSize);
+                log.trace("%s %s | %s", res.kernel.c_str(), v.label, td.c_str());
+                std::string err;
+                std::vector<double> ms;
+                // 1) Gauge speed on 1/32 of the work (1024x1024x256) before committing
+                //    the GPU to full 2048^3 dispatches.
                 VkResult pr;
-                VkPipeline p = makePipeline(g, mods[mi], lM, lN, lK, t, v.stages, pr);
-                if (!p) tr.note = "pipeline creation failed (" + std::to_string(pr) + ")";
+                VkPipeline pp = makePipeline(g, mods[mi], lM, lN, lK, t, v.stages, pr,
+                                             kProbeMN, kProbeMN, kProbeK);
+                if (!pp) tr.note = "pipeline creation failed (" + std::to_string(pr) + ")";
                 else {
-                    std::vector<double> ms;
-                    std::string err;
-                    if (runTimed(g, p, kSize / TN, kSize / TM, 1, 3, ms, err)) {
-                        tr.tops = tops(median(ms));
-                        if (tr.tops > bestTops) { bestTops = tr.tops; best = t; }
-                    } else tr.note = err;
-                    vkDestroyPipeline(g.dev, p, nullptr);
+                    if (!runTimed(g, pp, kProbeMN / TN, kProbeMN / TM, 0, 1, ms, err)) tr.note = "probe: " + err;
+                    else {
+                        double est = ms[0] * kProbeScale;
+                        if (est > kMaxEstMs) {
+                            char b[96];
+                            snprintf(b, sizeof b, "too slow (~%.0f ms est. per 2048^3)", est);
+                            tr.note = b;
+                        }
+                    }
+                    if (!g.hung) vkDestroyPipeline(g.dev, pp, nullptr);
                 }
+                // 2) Short full-size run.
+                if (tr.note.empty()) {
+                    VkPipeline p = makePipeline(g, mods[mi], lM, lN, lK, t, v.stages, pr);
+                    if (!p) tr.note = "pipeline creation failed (" + std::to_string(pr) + ")";
+                    else {
+                        if (runTimed(g, p, kSize / TN, kSize / TM, 1, 3, ms, err)) {
+                            tr.tops = tops(median(ms));
+                            if (tr.tops > bestTops) { bestTops = tr.tops; best = t; }
+                        } else tr.note = err;
+                        if (!g.hung) vkDestroyPipeline(g.dev, p, nullptr);
+                    }
+                }
+                log.trace("  -> %s", tr.note.empty() ? (std::to_string(tr.tops) + " T/s").c_str() : tr.note.c_str());
             }
             res.tune.push_back(tr);
         }
@@ -738,7 +796,7 @@ void benchEntry(Gpu &g, AAssetManager *am, Log &log, Entry &e) {
             res.status = "fail";
             res.reason = p ? err : "pipeline creation failed (" + std::to_string(pr) + ")";
         }
-        if (p) vkDestroyPipeline(g.dev, p, nullptr);
+        if (p && !g.hung) vkDestroyPipeline(g.dev, p, nullptr);
 
         done(res);
     }
@@ -756,6 +814,9 @@ void benchEntry(Gpu &g, AAssetManager *am, Log &log, Entry &e) {
         e.vars.swap(keep);
     }
 
+    // After a fence timeout the GPU may still be reading/writing these: leak them
+    // (the process exits soon) rather than free memory under a running kernel.
+    if (g.hung) return;
     for (VkShaderModule m : mods) if (m) vkDestroyShaderModule(g.dev, m, nullptr);
     freeBuf(g, bA); freeBuf(g, bB); freeBuf(g, bD);
 }
@@ -763,7 +824,7 @@ void benchEntry(Gpu &g, AAssetManager *am, Log &log, Entry &e) {
 // ---------------------------------------------------------------------------
 // Top level
 // ---------------------------------------------------------------------------
-std::string run(AAssetManager *am, Log &log) {
+std::string run(AAssetManager *am, Log &log, uint32_t variantMask) {
     Json j;
     j.obj();
     j.kv("problem", (int)kSize);
@@ -776,7 +837,7 @@ std::string run(AAssetManager *am, Log &log) {
         if (!fatal.empty()) j.kv("error", fatal);
         j.kv("log", log.text);
         j.endObj();
-        if (g.dev) {
+        if (g.dev && !g.hung) {   // hung: the GPU may never go idle, so leak the device
             vkDeviceWaitIdle(g.dev);
             if (g.qpool) vkDestroyQueryPool(g.dev, g.qpool, nullptr);
             if (g.fence) vkDestroyFence(g.dev, g.fence, nullptr);
@@ -786,7 +847,7 @@ std::string run(AAssetManager *am, Log &log) {
             if (g.dsl) vkDestroyDescriptorSetLayout(g.dev, g.dsl, nullptr);
             vkDestroyDevice(g.dev, nullptr);
         }
-        if (g.instance) vkDestroyInstance(g.instance, nullptr);
+        if (g.instance && !g.hung) vkDestroyInstance(g.instance, nullptr);
         return j.str();
     };
 
@@ -1059,7 +1120,12 @@ std::string run(AAssetManager *am, Log &log) {
     }
 
     log.line("");
-    log.line("=== %ux%ux%u GEMM, one run per configuration ===", kSize, kSize, kSize);
+    {
+        std::string on;
+        for (size_t v = 0; v < sizeof kVariants / sizeof kVariants[0]; ++v)
+            if (variantMask & (1u << v)) { if (!on.empty()) on += ", "; on += kVariants[v].label; }
+        log.line("=== %ux%ux%u GEMM, one run per configuration; paths: %s ===", kSize, kSize, kSize, on.c_str());
+    }
     for (size_t i = 0; i < entries.size(); ++i) {
         Entry &e = entries[i];
         const auto &c = e.cfg;
@@ -1070,7 +1136,7 @@ std::string run(AAssetManager *am, Log &log) {
         if (g.lost) { e.status = "skip"; e.reason = "device lost earlier"; }
         else {
             e.reason = unsupportedReason(g, c);
-            if (e.reason.empty()) benchEntry(g, am, log, e);
+            if (e.reason.empty()) benchEntry(g, am, log, e, variantMask);
         }
         if (e.status == "ok")
             log.line("      => best: %s  %.3f %s  check %s", e.label.c_str(), e.value, isInt ? "TOPS" : "TFLOPS",
@@ -1116,14 +1182,16 @@ std::string run(AAssetManager *am, Log &log) {
 }  // namespace
 
 extern "C" JNIEXPORT jstring JNICALL
-Java_com_minsuk_coopmatprobe_MainActivity_nativeRun(JNIEnv *env, jobject thiz, jobject assetManager) {
+Java_com_minsuk_coopmatprobe_MainActivity_nativeRun(JNIEnv *env, jobject thiz, jobject assetManager, jint variantMask) {
     Log log;
     log.env = env;
     log.cb = thiz;
     jclass cls = env->GetObjectClass(thiz);
     log.mid = env->GetMethodID(cls, "onNativeProgress", "(Ljava/lang/String;)V");
     if (!log.mid) env->ExceptionClear();
+    log.midTrace = env->GetMethodID(cls, "onNativeTrace", "(Ljava/lang/String;)V");
+    if (!log.midTrace) env->ExceptionClear();
     AAssetManager *am = AAssetManager_fromJava(env, assetManager);
-    std::string json = run(am, log);
+    std::string json = run(am, log, (uint32_t)variantMask);
     return env->NewStringUTF(json.c_str());
 }

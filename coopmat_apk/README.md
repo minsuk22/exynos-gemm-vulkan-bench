@@ -40,9 +40,25 @@ Results are shown on screen, written to logcat (tag `COOPMAT`), and saved to
 - **Tuning**: before timing, each configuration × path tries 12 tilings (6
   warp/workgroup shapes × 2 BK depths) for 3 dispatches each. Only the fastest
   one is timed. Tap a result row to see every tiling's number for every path.
-- **Timing**: 2 warm-up dispatches, then 10 timed dispatches in one submit. The
-  time for each dispatch is the gap between consecutive bottom-of-pipe
-  timestamps. The headline number is `2·2048³ / median`.
+- **Timing**: 2 warm-up dispatches, then 10 timed dispatches. Each dispatch is
+  its own submit, timed by a timestamp pair around it, and the CPU waits for it
+  before sending the next. The headline number is `2·2048³ / median`.
+- **GPU safety** (added in v1.2 after v1.1 froze a phone partway through a
+  run):
+  - Before any full-size dispatch, each tiling runs once at 1024×1024×256
+    (1/32 of the work). If that projects to more than 250 ms per 2048³, the
+    tiling is skipped as "too slow".
+  - With one dispatch per submit, no single submission can hold the GPU for
+    long. The display compositor shares the GPU, and the kernel driver resets
+    the GPU when a submission runs too long.
+  - A dispatch that takes over 1 s stops that tiling.
+  - A fence that doesn't signal within 8 s marks the device as lost. Every
+    later step is skipped, and nothing the GPU might still be using is freed.
+- **Crash breadcrumb**: every progress line, and the kernel/path/tiling about to
+  run, is appended and fsync'ed to `files/progress.log`. If a run never reaches
+  its end mark, the next launch shows the tail of that file, i.e. what was
+  running when it died. The checkboxes under the buttons turn individual paths
+  off, so a bad path can be isolated.
 - **Check**: inputs are random values from {-1,0,1} (or {0,1,2} for unsigned
   types). Every format holds these exactly, and every partial sum is a small
   integer. 64 outputs (two corners plus 62 random) are compared against a CPU

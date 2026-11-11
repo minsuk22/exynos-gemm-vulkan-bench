@@ -16,6 +16,7 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowManager;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.HorizontalScrollView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -53,7 +54,14 @@ public class MainActivity extends Activity {
     private static final int OK = 0xFF81C784;
     private static final int BAD = 0xFFE57373;
 
-    private native String nativeRun(Object assetManager);
+    private native String nativeRun(Object assetManager, int variantMask);
+
+    // Same order as kVariants in coopmat_probe.cpp (bit i = path i).
+    private static final String[] PATHS = { "no LDS", "LDS x1", "LDS x2", "LDS x3" };
+    private final CheckBox[] pathBoxes = new CheckBox[PATHS.length];
+    private static final String TRACE_FILE = "progress.log";
+    private static final String END_MARK = "#RUN-END";
+    private FileOutputStream trace;   // crash breadcrumb, fsync'ed per line
 
     private LinearLayout results;
     private TextView status;
@@ -95,6 +103,22 @@ public class MainActivity extends Activity {
         btns.addView(copyBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
         root.addView(btns);
 
+        LinearLayout paths = new LinearLayout(this);
+        paths.setOrientation(LinearLayout.HORIZONTAL);
+        paths.setPadding(0, dp(6), 0, 0);
+        for (int i = 0; i < PATHS.length; i++) {
+            CheckBox cb = new CheckBox(this);
+            cb.setText(PATHS[i]);
+            cb.setTextColor(TEXT);
+            cb.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+            cb.setChecked(true);
+            pathBoxes[i] = cb;
+            paths.addView(cb, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        }
+        HorizontalScrollView phs = new HorizontalScrollView(this);
+        phs.addView(paths);
+        root.addView(phs);
+
         status = text("버튼을 누르면 장치 정보를 읽고 지원되는 모든 subgroup 설정을 2048³으로 측정합니다. "
                 + "설정 수에 따라 수십 초 걸릴 수 있습니다.", 13, MUTED, false);
         status.setPadding(0, dp(12), 0, dp(8));
@@ -109,13 +133,100 @@ public class MainActivity extends Activity {
         root.addView(liveLog);
 
         setContentView(scroll);
+        showPreviousCrash();
+    }
+
+    // -------------------------------------------------- crash breadcrumb file
+
+    private File traceFile() {
+        File dir = getExternalFilesDir(null);
+        if (dir == null) dir = getFilesDir();
+        return new File(dir, TRACE_FILE);
+    }
+
+    private synchronized void traceLine(String s) {
+        if (trace == null) return;
+        try {
+            trace.write((s + "\n").getBytes(StandardCharsets.UTF_8));
+            trace.getFD().sync();   // survive an app kill or a phone reset
+        } catch (Exception ignored) { }
+    }
+
+    private synchronized void traceOpen(int mask) {
+        try {
+            trace = new FileOutputStream(traceFile(), false);
+        } catch (Exception e) {
+            trace = null;
+        }
+        traceLine("#RUN-START " + new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(new Date())
+                + "  " + Build.MANUFACTURER + " " + Build.MODEL + "  app " + appVersion() + "  paths mask " + mask);
+    }
+
+    private synchronized void traceClose() {
+        traceLine(END_MARK);
+        try { if (trace != null) trace.close(); } catch (Exception ignored) { }
+        trace = null;
+    }
+
+    private String appVersion() {
+        try { return getPackageManager().getPackageInfo(getPackageName(), 0).versionName; }
+        catch (Exception e) { return "?"; }
+    }
+
+    /** If the last run never reached its end mark, show where it stopped. */
+    private void showPreviousCrash() {
+        File f = traceFile();
+        if (!f.exists() || f.length() == 0) return;
+        List<String> lines = new ArrayList<>();
+        try (java.io.BufferedReader r = new java.io.BufferedReader(
+                new java.io.InputStreamReader(new java.io.FileInputStream(f), StandardCharsets.UTF_8))) {
+            String s;
+            while ((s = r.readLine()) != null) lines.add(s);
+        } catch (Exception e) {
+            return;
+        }
+        if (lines.isEmpty() || END_MARK.equals(lines.get(lines.size() - 1))) return;
+
+        int from = Math.max(0, lines.size() - 25);
+        StringBuilder tail = new StringBuilder();
+        if (from > 0) tail.append(lines.get(0)).append("\n…\n");
+        for (int i = from; i < lines.size(); i++) tail.append(lines.get(i)).append('\n');
+        final String text = tail.toString().trim();
+
+        LinearLayout c = card("⚠ 이전 측정이 끝나지 않고 종료됨");
+        c.addView(text("앱이 강제 종료되었거나 GPU가 멈춘 것 같습니다. 마지막으로 실행 중이던 단계(맨 아래 줄)가 원인일 가능성이 큽니다. "
+                + "문제가 된 경로의 체크를 끄고 다시 측정할 수 있습니다.", 12, BAD, false));
+        TextView lt = text(text, 10, MUTED, false);
+        lt.setTypeface(Typeface.MONOSPACE);
+        lt.setTextIsSelectable(true);
+        lt.setPadding(0, dp(8), 0, dp(8));
+        HorizontalScrollView hs = new HorizontalScrollView(this);
+        hs.addView(lt);
+        c.addView(hs);
+        Button cp = button("이 로그 복사");
+        cp.setOnClickListener(v -> {
+            ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+            cm.setPrimaryClip(ClipData.newPlainText("coopmat crash log", text));
+            Toast.makeText(this, "복사했습니다", Toast.LENGTH_SHORT).show();
+        });
+        c.addView(cp);
+        results.addView(c);
     }
 
     // ------------------------------------------------------------------ run
 
     private void start() {
         if (running) return;
+        int m = 0;
+        for (int i = 0; i < pathBoxes.length; i++) if (pathBoxes[i].isChecked()) m |= 1 << i;
+        if (m == 0) {
+            Toast.makeText(this, "측정할 경로를 하나 이상 선택하세요", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        final int mask = m;
         running = true;
+        for (CheckBox cb : pathBoxes) cb.setEnabled(false);
+        traceOpen(mask);
         runBtn.setEnabled(false);
         copyBtn.setEnabled(false);
         results.removeAllViews();
@@ -129,7 +240,7 @@ public class MainActivity extends Activity {
         new Thread(() -> {
             String json;
             try {
-                json = nativeRun(getAssets());
+                json = nativeRun(getAssets(), mask);
             } catch (Throwable t) {
                 json = "{\"error\":\"" + t.toString().replace("\"", "'") + "\"}";
             }
@@ -141,15 +252,28 @@ public class MainActivity extends Activity {
     /** Called from native code on the benchmark thread. */
     @SuppressWarnings("unused")
     public void onNativeProgress(String line) {
+        traceLine(line);
         runOnUiThread(() -> {
             logBuf.append(line).append('\n');
             liveLog.setText(logBuf);
-            if (line.startsWith("[")) status.setText("측정 중  " + line.trim());
+            if (line.startsWith("[")) { curConfig = line.trim(); status.setText("측정 중  " + curConfig); }
         });
     }
 
+    private volatile String curConfig = "";
+
+    /** Called from native code right before each risky GPU step (breadcrumb only). */
+    @SuppressWarnings("unused")
+    public void onNativeTrace(String line) {
+        traceLine("  . " + line);
+        if (line.startsWith("  ->")) return;
+        runOnUiThread(() -> status.setText("측정 중  " + curConfig + "\n" + line));
+    }
+
     private void onDone(String json) {
+        traceClose();
         running = false;
+        for (CheckBox cb : pathBoxes) cb.setEnabled(true);
         runBtn.setEnabled(true);
         runBtn.setText("다시 측정");
         getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
