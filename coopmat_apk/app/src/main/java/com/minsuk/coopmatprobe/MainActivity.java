@@ -142,7 +142,7 @@ public class MainActivity extends Activity {
 
     // -------------------------------------------------- crash breadcrumb file
 
-    private static final int MAX_ATTEMPTS = 12;
+    private static final int MAX_ATTEMPTS = 20;
 
     private File traceFile() {
         return new File(BenchService.dir(this), BenchService.TRACE_FILE);
@@ -212,6 +212,7 @@ public class MainActivity extends Activity {
     private volatile String curConfig = "";
 
     private final Messenger inbox = new Messenger(new Handler(Looper.getMainLooper(), m -> {
+        lastActivity = android.os.SystemClock.uptimeMillis();
         Bundle d = m.getData();
         String a = d.getString("a", "");
         switch (m.what) {
@@ -223,6 +224,9 @@ public class MainActivity extends Activity {
             case BenchService.MSG_TRACE:
                 if (!a.startsWith("#") && !a.startsWith("  ->"))
                     status.setText("측정 중  " + curConfig + "\n" + a);
+                break;
+            case BenchService.MSG_PID:
+                try { benchPid = Integer.parseInt(a); } catch (NumberFormatException ignored) { }
                 break;
             case BenchService.MSG_ENTRY:
                 doneEntries.put(a, d.getString("b", ""));
@@ -266,6 +270,11 @@ public class MainActivity extends Activity {
     private void launchAttempt() {
         attempt++;
         finished = false;
+        benchPid = 0;
+        hangKilled = false;
+        lastActivity = android.os.SystemClock.uptimeMillis();
+        watchdog.removeCallbacks(watchdogTick);
+        watchdog.postDelayed(watchdogTick, 1000);
         final int thisAttempt = attempt;
         conn = new ServiceConnection() {
             @Override
@@ -309,11 +318,13 @@ public class MainActivity extends Activity {
         return sb.toString();
     }
 
-    /** The benchmark process died before finishing. Find out where, then retry without it. */
+    /** The benchmark process died (or was killed by the watchdog) before finishing.
+     *  Find out where, then retry without it. */
     private void onBenchDied() {
         if (finished) return;
         finished = true;
         stopService();
+        final boolean wasHang = hangKilled;
 
         List<String> trace = readTrace();
         if (!trace.isEmpty() && BenchService.END_MARK.equals(trace.get(trace.size() - 1))) {
@@ -323,42 +334,88 @@ public class MainActivity extends Activity {
         }
 
         // Everything finished so far (also covers messages lost in the crash), and
-        // the last config / path / step of the attempt that died.
-        String cfg = null, var = null, step = "";
+        // the last config / path / tiling / step of the attempt that died.
+        String cfg = null, var = null, tile = null, step = "", stepDetail = "";
         for (String s : trace) {
             if (s.startsWith("#ENTRY\t")) {
                 String[] f = s.split("\t", 3);
                 if (f.length == 3) doneEntries.put(f[1], f[2]);
             } else if (s.startsWith("#ATTEMPT")) {
-                cfg = null; var = null; step = "";
+                cfg = null; var = null; tile = null; step = ""; stepDetail = "";
             } else if (s.startsWith("  . #CFG ")) {
-                cfg = s.substring(9).trim(); var = null; step = "";
+                cfg = s.substring(9).trim(); var = null; tile = null; step = ""; stepDetail = "";
             } else if (s.startsWith("  . #VAR ")) {
-                var = s.substring(9).trim(); step = "";
+                var = s.substring(9).trim(); tile = null; step = ""; stepDetail = "";
+            } else if (s.startsWith("  . #TILE ")) {
+                tile = s.substring(10).trim(); step = ""; stepDetail = "";
             } else if (s.startsWith("  . ") && !s.startsWith("  .   ->")) {
-                step = s.substring(4).trim();
+                String t = s.substring(4).trim();
+                if (t.startsWith("step:")) {
+                    stepDetail = t;                           // e.g. "step: run (1/32 probe)"
+                } else {
+                    if (t.contains("final run")) tile = null; // past the tuning sweep
+                    step = t;                                 // kernel / path / tiling line
+                    stepDetail = "";
+                }
             }
         }
         if (cfg != null && doneEntries.containsKey(cfg)) cfg = null;   // died after finishing it
+        if (!stepDetail.isEmpty()) step = (step.isEmpty() ? "" : step + "  ") + "[" + stepDetail.substring(5).trim() + "]";
 
-        String where = cfg == null ? "(벤치마크 시작 단계)" : cfg + (var != null ? " / " + var : "") + (step.isEmpty() ? "" : "\n   " + step);
-        String note = "\n!!! 측정 프로세스가 종료됨 (GPU 드라이버 crash 추정, 시도 " + attempt + ")\n    위치: " + where + "\n";
-        logBuf.append(note);
+        String what = wasHang ? "응답 없음 " + (WATCHDOG_MS / 1000) + "초 → 강제 종료 (GPU/드라이버 hang 추정"
+                              : "측정 프로세스가 종료됨 (GPU 드라이버 crash 추정";
+        String where = cfg == null ? "(벤치마크 시작 단계)"
+                : cfg + (var != null ? " / " + var : "") + (tile != null ? " / tiling #" + tile : "")
+                  + (step.isEmpty() ? "" : "\n      " + step);
+        logBuf.append("\n!!! ").append(what).append(", 시도 ").append(attempt).append(")\n    위치: ").append(where).append('\n');
         liveLog.setText(logBuf);
 
-        String rec = cfg == null ? null : "C\t" + cfg + "\t" + (var != null ? var : "*") + "\t" + step.replace('\t', ' ');
-        boolean repeat = rec != null && crashes.contains(rec);
+        // Skip just that tiling the first time; if the same path fails again, skip the whole path.
+        String target = var == null ? "*" : var;
+        if (var != null && tile != null) {
+            boolean pathFailedBefore = false;
+            for (String c : crashes) if (c.startsWith("C\t" + cfg + "\t" + var + "|")) pathFailedBefore = true;
+            if (!pathFailedBefore) target = var + "|" + tile;
+        }
+        String rec = cfg == null ? null : "C\t" + cfg + "\t" + target + "\t" + (wasHang ? "hang: " : "crash: ") + step.replace('\t', ' ');
+        boolean repeat = false;
+        if (rec != null) for (String c : crashes) if (c.startsWith("C\t" + cfg + "\t" + target + "\t")) repeat = true;
         if (rec == null || repeat || attempt >= MAX_ATTEMPTS) {
             logBuf.append("    더 이상 건너뛸 수 없어 중단합니다.\n");
-            onDone("{\"error\":\"측정 프로세스가 반복해서 종료되었습니다. 위치: " + where.replace("\"", "'").replace("\n", " ") + "\"}");
+            onDone("{\"error\":\"측정 프로세스가 반복해서 멈추거나 종료되었습니다. 위치: " + where.replace("\"", "'").replace("\n", " ") + "\"}");
             return;
         }
         crashes.add(rec);
-        logBuf.append("    이 경로를 건너뛰고 이어서 측정합니다…\n");
+        logBuf.append(target.contains("|") ? "    이 tiling만 건너뛰고 이어서 측정합니다…\n"
+                : "    이 경로를 건너뛰고 이어서 측정합니다…\n");
         liveLog.setText(logBuf);
         status.setText("측정 프로세스 재시작 중 (시도 " + (attempt + 1) + ")");
-        new Handler(Looper.getMainLooper()).postDelayed(this::launchAttempt, 800);
+        new Handler(Looper.getMainLooper()).postDelayed(this::launchAttempt, 1500);
     }
+
+    // ---- watchdog: a step that never returns (shader compiler or GPU hang) ----
+
+    private static final long WATCHDOG_MS = 30_000;
+    private volatile int benchPid = 0;
+    private long lastActivity = 0;
+    private boolean hangKilled = false;
+    private final Handler watchdog = new Handler(Looper.getMainLooper());
+    private final Runnable watchdogTick = new Runnable() {
+        @Override
+        public void run() {
+            if (!running || finished) return;
+            long idle = android.os.SystemClock.uptimeMillis() - lastActivity;
+            if (benchPid > 0 && idle > WATCHDOG_MS && !hangKilled) {
+                hangKilled = true;
+                android.os.Process.killProcess(benchPid);   // same app uid, so this is allowed
+                // onServiceDisconnected -> onBenchDied takes it from here.
+            } else if (idle > WATCHDOG_MS / 2) {
+                status.setText("측정 중  " + curConfig + "\n응답 대기 " + (idle / 1000) + "초 / " + (WATCHDOG_MS / 1000) + "초…");
+            }
+            watchdog.postDelayed(this, 1000);
+        }
+    };
+
 
     private String readFile(String path) {
         if (path == null || path.isEmpty()) return "{\"error\":\"결과 파일 없음\"}";

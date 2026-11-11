@@ -62,7 +62,13 @@ Results are shown on screen, written to logcat (tag `COOPMAT`), and saved to
     fsync'ed there first.
   - starts a new attempt that marks that path as FAIL ("crashed the app") and
     reuses every config already finished.
-  - stops after 12 attempts, or if the same spot crashes twice.
+  - stops after 20 attempts, or if the same spot crashes twice.
+- **Hang watchdog** (v1.4): a step that never returns, such as a shader compile
+  or GPU job stuck inside the driver, sends no more progress. If the bench
+  process is silent for 30 s, the UI kills it, and the same recovery path takes
+  over. The first failure in a path skips only that tiling; a second failure in
+  the same path skips the whole path. The breadcrumb records the exact step
+  (`compile / run`, `1/32 probe / 2048^3`).
 - **Leftover log**: if the whole app or phone goes down, the next launch shows
   the tail of `progress.log`. The checkboxes under the buttons turn individual
   paths off.

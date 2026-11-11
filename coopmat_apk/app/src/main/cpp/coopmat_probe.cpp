@@ -565,7 +565,8 @@ struct Entry : Result {           // top-level fields = fastest passing variant
 // Crash-recovery state handed in by the Java side. One record per line,
 // tab-separated:
 //   D <configKey> <entry JSON>              config finished in an earlier attempt
-//   C <configKey> <variantId> <last step>   this path killed the process before
+//   C <configKey> <variantId>[|tileIdx] <last step>   that path (or just that tiling)
+//                                       crashed or hung the process before; "*" = whole config
 // ---------------------------------------------------------------------------
 struct Resume {
     std::map<std::string, std::string> done;      // configKey -> entry JSON
@@ -814,7 +815,8 @@ void benchEntry(Gpu &g, AAssetManager *am, Log &log, Entry &e, uint32_t variantM
         // --- tune ---
         Tile best{};
         double bestTops = -1;
-        for (const Tile &t : cands) {
+        for (size_t ti = 0; ti < cands.size(); ++ti) {
+            const Tile &t = cands[ti];
             if (g.lost) break;
             TuneResult tr{ t, NAN, "" };
             uint32_t TM = t.tileM(lM), TN = t.tileN(lN), thr = t.wgW * t.wgH * g.sgSize;
@@ -824,17 +826,25 @@ void benchEntry(Gpu &g, AAssetManager *am, Log &log, Entry &e, uint32_t variantM
             else if (lds > L.maxComputeSharedMemorySize) tr.note = "LDS " + std::to_string(lds) + " B > limit";
             else if (thr > L.maxComputeWorkGroupInvocations || thr > L.maxComputeWorkGroupSize[0]) tr.note = "too many invocations";
             if (tr.note.empty()) {
+                auto it = crashed.find(cfgKey + "|" + v.id + "|" + std::to_string(ti));
+                if (it != crashed.end())
+                    tr.note = "hung/crashed the app on an earlier attempt, skipped (" + it->second + ")";
+            }
+            if (tr.note.empty()) {
                 const std::string td = tileDesc(t, lM, lN, g.sgSize);
+                log.trace("#TILE %zu", ti);
                 log.trace("%s %s | %s", res.kernel.c_str(), v.label, td.c_str());
                 std::string err;
                 std::vector<double> ms;
                 // 1) Gauge speed on 1/32 of the work (1024x1024x256) before committing
                 //    the GPU to full 2048^3 dispatches.
                 VkResult pr;
+                log.trace("    step: compile (1/32 probe)");
                 VkPipeline pp = makePipeline(g, mods[mi], lM, lN, lK, t, v.stages, pr,
                                              kProbeMN, kProbeMN, kProbeK);
                 if (!pp) tr.note = "pipeline creation failed (" + std::to_string(pr) + ")";
                 else {
+                    log.trace("    step: run (1/32 probe)");
                     if (!runTimed(g, pp, kProbeMN / TN, kProbeMN / TM, 0, 1, ms, err)) tr.note = "probe: " + err;
                     else {
                         double est = ms[0] * kProbeScale;
@@ -848,9 +858,11 @@ void benchEntry(Gpu &g, AAssetManager *am, Log &log, Entry &e, uint32_t variantM
                 }
                 // 2) Short full-size run.
                 if (tr.note.empty()) {
+                    log.trace("    step: compile (2048^3)");
                     VkPipeline p = makePipeline(g, mods[mi], lM, lN, lK, t, v.stages, pr);
                     if (!p) tr.note = "pipeline creation failed (" + std::to_string(pr) + ")";
                     else {
+                        log.trace("    step: run (2048^3 x4)");
                         if (runTimed(g, p, kSize / TN, kSize / TM, 1, 3, ms, err)) {
                             tr.tops = tops(median(ms));
                             if (tr.tops > bestTops) { bestTops = tr.tops; best = t; }

@@ -37,7 +37,7 @@ import java.util.Locale;
 public class BenchService extends Service {
     static { System.loadLibrary("coopmat_probe"); }
 
-    static final int MSG_START = 1, MSG_PROGRESS = 2, MSG_TRACE = 3, MSG_ENTRY = 4, MSG_DONE = 5;
+    static final int MSG_START = 1, MSG_PROGRESS = 2, MSG_TRACE = 3, MSG_ENTRY = 4, MSG_DONE = 5, MSG_PID = 6;
     static final String TRACE_FILE = "progress.log";
     static final String RESULT_FILE = "last_result.json";
     static final String END_MARK = "#RUN-END";
@@ -79,6 +79,7 @@ public class BenchService extends Service {
             traceLine("#RUN-START " + new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(new Date())
                     + "  " + Build.MANUFACTURER + " " + Build.MODEL + "  app " + version + "  paths mask " + mask);
         traceLine("#ATTEMPT " + attempt);
+        send(MSG_PID, Integer.toString(android.os.Process.myPid()), null);   // lets the UI kill a hung run
 
         new Thread(() -> {
             String json;
