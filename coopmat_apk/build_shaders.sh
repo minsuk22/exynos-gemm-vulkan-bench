@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Compile shaders/coopmat_gemm.comp once per (A, B, C) type combination into
-# app/src/main/assets/shaders/gemm_<A>_<B>_<C>[_sat]_<v4|v1>.spv
+# app/src/main/assets/shaders/gemm_<A>_<B>_<C>[_sat]_<v4|v1>[_direct].spv
+#
+# Without _direct, A/B are staged through shared memory. The buffer count
+# (1/2/3) is spec constant 12, chosen when the pipeline is created. With
+# _direct, no shared memory is used.
 #
 # The app looks a kernel up by the names of the component types the device
 # advertises, so a combo that is not built here shows up as "no kernel" in the
@@ -64,16 +68,21 @@ for row in "${COMBOS[@]}"; do
     suffix=""; [[ "$sat" == 1 ]] && suffix="_sat"
     for ld in v4 v1; do
       if [[ $ld == v4 ]]; then ldt=uvec4; ldb=16; else ldt=uint; ldb=4; fi
-      name="gemm_${A}_${B}_${C}${suffix}_${ld}.spv"
-      "$GLSLANG" -V --target-env "$TENV" -Os \
-        -DA_T="${GLSL[$A]}" -DB_T="${GLSL[$B]}" -DC_T="${GLSL[$C]}" \
-        -DA_BYTES="${BYTES[$A]}" -DB_BYTES="${BYTES[$B]}" \
-        -DLD_T="$ldt" -DLD_BYTES="$ldb" -DSAT="$sat" "${flags[@]}" \
-        "$SRC" -o "$OUT/$name" >/dev/null
-      if [[ -n "$SPIRV_VAL" ]]; then
-        "$SPIRV_VAL" --target-env vulkan1.3 "$OUT/$name"
-      fi
-      n=$((n+1))
+      for direct in 0 1; do
+        dsuf=""; [[ $direct == 1 ]] && dsuf="_direct"
+        name="gemm_${A}_${B}_${C}${suffix}_${ld}${dsuf}.spv"
+        args=(-V --target-env "$TENV" -Os
+              -DA_T="${GLSL[$A]}" -DB_T="${GLSL[$B]}" -DC_T="${GLSL[$C]}"
+              -DA_BYTES="${BYTES[$A]}" -DB_BYTES="${BYTES[$B]}"
+              -DLD_T="$ldt" -DLD_BYTES="$ldb" -DSAT="$sat" -DDIRECT="$direct" "${flags[@]}")
+        if ! "$GLSLANG" "${args[@]}" "$SRC" -o "$OUT/$name" >/dev/null; then
+          echo "FAILED: $name"; "$GLSLANG" "${args[@]}" "$SRC" -o "$OUT/$name"; exit 1
+        fi
+        if [[ -n "$SPIRV_VAL" ]]; then
+          "$SPIRV_VAL" --target-env vulkan1.3 "$OUT/$name"
+        fi
+        n=$((n+1))
+      done
     done
   done
 done

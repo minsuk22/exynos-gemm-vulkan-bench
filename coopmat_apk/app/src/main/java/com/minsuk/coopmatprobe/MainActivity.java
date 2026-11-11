@@ -237,13 +237,19 @@ public class MainActivity extends Activity {
             LinearLayout c = card(n + "×" + n + "×" + n + " GEMM 성능 (D = A·B)");
             double max = 0;
             for (int i = 0; i < bench.length(); i++) {
-                JSONObject e = bench.optJSONObject(i);
-                if ("ok".equals(e.optString("status"))) max = Math.max(max, e.optDouble("value", 0));
+                JSONArray vs = bench.optJSONObject(i).optJSONArray("variants");
+                for (int k = 0; vs != null && k < vs.length(); k++) {
+                    JSONObject v = vs.optJSONObject(k);
+                    if ("ok".equals(v.optString("status"))) max = Math.max(max, v.optDouble("value", 0));
+                }
             }
             if (bench.length() == 0) c.addView(text("측정 가능한 subgroup configuration 없음", 13, MUTED, false));
             for (int i = 0; i < bench.length(); i++) c.addView(perfRow(bench.optJSONObject(i), max));
-            c.addView(note("TFLOPS/TOPS = 2·N³ / median GPU time (timestamp). 설정마다 workgroup/warp tiling 12가지를 "
-                    + "짧게 돌려 가장 빠른 것으로 10회 측정합니다. check = 무작위 64개 출력값을 CPU 결과와 비교. "
+            c.addView(note("TFLOPS/TOPS = 2·N³ / median GPU time (timestamp). 설정마다 4가지 메모리 경로를 각각 측정합니다: "
+                    + "no LDS = global에서 바로 coopMatLoad, LDS x1 = shared memory 단일 버퍼, "
+                    + "LDS x2/x3 = double/triple buffering (다음 slab을 register로 prefetch하며 계산). "
+                    + "경로마다 workgroup/warp tiling 12가지를 짧게 돌려 가장 빠른 것으로 10회 측정하고, "
+                    + "무작위 64개 출력값을 CPU 결과와 비교(check)합니다. ★ = 가장 빠른 경로. "
                     + "행을 누르면 tiling별 결과가 보입니다."));
             results.addView(c);
         }
@@ -275,6 +281,7 @@ public class MainActivity extends Activity {
         boolean ok = "ok".equals(e.optString("status"));
         boolean isInt = "TOPS".equals(e.optString("unit"));
         int accent = isInt ? ACCENT_I : ACCENT_F;
+        String unit = e.optString("unit");
 
         String combo = e.optString("a") + " × " + e.optString("b") + " → " + e.optString("r");
         String shape = e.optInt("m") + "×" + e.optInt("n") + "×" + e.optInt("k") + (e.optBoolean("sat") ? "  sat" : "");
@@ -286,57 +293,58 @@ public class MainActivity extends Activity {
         names.addView(text(combo, 15, TEXT, true));
         names.addView(text(shape, 12, MUTED, false));
         head.addView(names, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        LinearLayout right = vbox();
+        right.setGravity(Gravity.END);
         TextView val;
         if (ok) {
-            val = text(String.format(Locale.US, "%.2f %s", e.optDouble("value"), e.optString("unit")), 18, accent, true);
+            val = text(String.format(Locale.US, "%.2f %s", e.optDouble("value"), unit), 18, accent, true);
         } else {
             val = text("fail".equals(e.optString("status")) ? "FAIL" : "SKIP", 15,
                     "fail".equals(e.optString("status")) ? BAD : MUTED, true);
         }
         val.setGravity(Gravity.END);
-        head.addView(val);
+        right.addView(val);
+        if (ok) {
+            TextView bl = text("★ " + e.optString("bestLabel"), 11, MUTED, false);
+            bl.setGravity(Gravity.END);
+            right.addView(bl);
+        }
+        head.addView(right);
         box.addView(head);
 
-        if (ok) {
-            LinearLayout track = new LinearLayout(this);
-            track.setBackground(round(LINE, dp(3)));
-            View bar = new View(this);
-            bar.setBackground(round(accent, dp(3)));
-            float frac = max > 0 ? (float) (e.optDouble("value") / max) : 0f;
-            track.setWeightSum(1f);
-            track.addView(bar, new LinearLayout.LayoutParams(0, dp(6), Math.max(0.01f, frac)));
-            LinearLayout.LayoutParams tp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(6));
-            tp.topMargin = dp(6);
-            tp.bottomMargin = dp(4);
-            box.addView(track, tp);
-
-            String check = e.optString("check");
-            TextView d = text(String.format(Locale.US, "median %.3f ms · best %.3f ms (%.2f)  ·  check %s",
-                    e.optDouble("ms"), e.optDouble("msBest"), e.optDouble("valueBest"), check), 12,
-                    check.startsWith("pass") ? MUTED : BAD, false);
-            box.addView(d);
-            box.addView(text(e.optString("tile"), 11, MUTED, false));
-        } else {
+        JSONArray vars = e.optJSONArray("variants");
+        if (vars == null || vars.length() == 0) {
             String why = e.optString("reason");
-            if (!e.optString("check").isEmpty()) why += "  (" + e.optString("check") + ")";
             box.addView(text(why, 12, "fail".equals(e.optString("status")) ? BAD : MUTED, false));
+        } else {
+            String bestId = ok ? e.optString("best") : "";
+            for (int k = 0; k < vars.length(); k++)
+                box.addView(variantRow(vars.optJSONObject(k), max, accent, unit, bestId));
         }
 
-        JSONArray tune = e.optJSONArray("tune");
-        if (tune != null && tune.length() > 0) {
+        // Tap: every tiling tried, per variant.
+        if (vars != null && vars.length() > 0) {
             TextView tv = text("", 11, MUTED, false);
             tv.setTypeface(Typeface.MONOSPACE);
-            StringBuilder sb = new StringBuilder("kernel " + e.optString("kernel") + "\n");
-            for (int i = 0; i < tune.length(); i++) {
-                JSONObject t = tune.optJSONObject(i);
-                String v = t.isNull("value") ? "   -   " : String.format(Locale.US, "%7.3f", t.optDouble("value"));
-                sb.append(v).append("  ").append(t.optString("tile"));
-                if (!t.optString("note").isEmpty()) sb.append("  [").append(t.optString("note")).append("]");
+            StringBuilder sb = new StringBuilder();
+            for (int k = 0; k < vars.length(); k++) {
+                JSONObject v = vars.optJSONObject(k);
+                sb.append("— ").append(v.optString("label")).append("  (").append(v.optString("kernel")).append(")\n");
+                if (!v.optString("tile").isEmpty()) sb.append("  chosen: ").append(v.optString("tile")).append('\n');
+                JSONArray tune = v.optJSONArray("tune");
+                for (int i = 0; tune != null && i < tune.length(); i++) {
+                    JSONObject t = tune.optJSONObject(i);
+                    String s = t.isNull("value") ? "   -   " : String.format(Locale.US, "%7.3f", t.optDouble("value"));
+                    sb.append(s).append("  ").append(t.optString("tile"));
+                    if (!t.optString("note").isEmpty()) sb.append("  [").append(t.optString("note")).append("]");
+                    sb.append('\n');
+                }
+                if (tune == null || tune.length() == 0) sb.append("  ").append(v.optString("reason")).append('\n');
                 sb.append('\n');
             }
             tv.setText(sb.toString().trim());
             tv.setVisibility(View.GONE);
-            tv.setPadding(0, dp(6), 0, 0);
+            tv.setPadding(0, dp(8), 0, 0);
             HorizontalScrollView hs = new HorizontalScrollView(this);
             hs.addView(tv);
             box.addView(hs);
@@ -351,6 +359,60 @@ public class MainActivity extends Activity {
         return wrap;
     }
 
+    /** One memory-path line: label | bar | value, then median/best/check underneath. */
+    private View variantRow(JSONObject v, double max, int accent, String unit, String bestId) {
+        LinearLayout col = vbox();
+        col.setPadding(0, dp(8), 0, 0);
+        boolean ok = "ok".equals(v.optString("status"));
+        boolean best = v.optString("id").equals(bestId);
+
+        LinearLayout line = new LinearLayout(this);
+        line.setOrientation(LinearLayout.HORIZONTAL);
+        line.setGravity(Gravity.CENTER_VERTICAL);
+        TextView lab = text((best ? "★ " : "") + v.optString("label"), 12, best ? TEXT : MUTED, best);
+        line.addView(lab, new LinearLayout.LayoutParams(dp(118), ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        LinearLayout track = new LinearLayout(this);
+        track.setBackground(round(LINE, dp(3)));
+        track.setWeightSum(1f);
+        if (ok) {
+            View bar = new View(this);
+            bar.setBackground(round(best ? accent : (accent & 0x00FFFFFF) | 0x99000000, dp(3)));
+            float frac = max > 0 ? (float) (v.optDouble("value") / max) : 0f;
+            track.addView(bar, new LinearLayout.LayoutParams(0, dp(6), Math.max(0.01f, Math.min(1f, frac))));
+        }
+        LinearLayout.LayoutParams tp = new LinearLayout.LayoutParams(0, dp(6), 1);
+        tp.rightMargin = dp(8);
+        line.addView(track, tp);
+
+        String vs;
+        int vc;
+        if (ok) { vs = String.format(Locale.US, "%.2f", v.optDouble("value")); vc = best ? accent : TEXT; }
+        else if ("fail".equals(v.optString("status"))) { vs = "FAIL"; vc = BAD; }
+        else { vs = "SKIP"; vc = MUTED; }
+        TextView vt = text(vs, 13, vc, true);
+        vt.setGravity(Gravity.END);
+        line.addView(vt, new LinearLayout.LayoutParams(dp(56), ViewGroup.LayoutParams.WRAP_CONTENT));
+        col.addView(line);
+
+        String detail;
+        int dc = MUTED;
+        if (ok) {
+            String check = v.optString("check");
+            detail = String.format(Locale.US, "median %.3f ms · best %.3f ms (%.2f %s) · %s",
+                    v.optDouble("ms"), v.optDouble("msBest"), v.optDouble("valueBest"), unit, check);
+            if (!check.startsWith("pass")) dc = BAD;
+        } else {
+            detail = v.optString("reason");
+            if (!v.optString("check").isEmpty()) detail += "  (" + v.optString("check") + ")";
+            if ("fail".equals(v.optString("status"))) dc = BAD;
+        }
+        TextView dt = text(detail, 10, dc, false);
+        dt.setPadding(dp(118), dp(1), 0, 0);
+        col.addView(dt);
+        return col;
+    }
+
     // --------------------------------------------------------------- report
 
     private String buildReport(JSONObject o) {
@@ -362,18 +424,36 @@ public class MainActivity extends Activity {
         sb.append(o.optString("log", ""));
         JSONArray bench = o.optJSONArray("bench");
         if (bench != null && bench.length() > 0) {
-            sb.append("\nSummary (").append(o.optInt("problem")).append("^3)\n");
+            sb.append("\nSummary (").append(o.optInt("problem"))
+                    .append("^3, TFLOPS/TOPS by memory path, * = fastest)\n");
+            String hdr = String.format(Locale.US, "%-48s %9s %9s %9s %9s  unit", "", "no LDS", "LDS x1", "LDS x2", "LDS x3");
+            sb.append(hdr).append('\n');
+            String[] ids = { "direct", "lds1", "lds2", "lds3" };
             for (int i = 0; i < bench.length(); i++) {
                 JSONObject e = bench.optJSONObject(i);
                 String head = String.format(Locale.US, "%-9s x %-9s -> %-7s %3dx%-3dx%-3d%s", e.optString("a"),
                         e.optString("b"), e.optString("r"), e.optInt("m"), e.optInt("n"), e.optInt("k"),
                         e.optBoolean("sat") ? " sat" : "    ");
-                if ("ok".equals(e.optString("status")))
-                    sb.append(String.format(Locale.US, "%s  %8.3f %-6s  %.3f ms  %s\n", head, e.optDouble("value"),
-                            e.optString("unit"), e.optDouble("ms"), e.optString("check")));
-                else
+                JSONArray vs = e.optJSONArray("variants");
+                if (vs == null || vs.length() == 0) {
                     sb.append(head).append("  ").append(e.optString("status")).append(": ")
                             .append(e.optString("reason")).append('\n');
+                    continue;
+                }
+                sb.append(String.format(Locale.US, "%-48s", head));
+                String best = "ok".equals(e.optString("status")) ? e.optString("best") : "";
+                for (String id : ids) {
+                    String cell = "-";
+                    for (int k = 0; k < vs.length(); k++) {
+                        JSONObject v = vs.optJSONObject(k);
+                        if (!id.equals(v.optString("id"))) continue;
+                        if ("ok".equals(v.optString("status")))
+                            cell = String.format(Locale.US, "%.3f", v.optDouble("value")) + (id.equals(best) ? "*" : " ");
+                        else cell = v.optString("status").toUpperCase(Locale.US) + " ";
+                    }
+                    sb.append(String.format(Locale.US, " %9s", cell));
+                }
+                sb.append("  ").append(e.optString("unit")).append('\n');
             }
         }
         return sb.toString();

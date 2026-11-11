@@ -5,7 +5,8 @@
 //   1. pick the first physical device exposing VK_KHR_cooperative_matrix
 //   2. dump every VkCooperativeMatrixPropertiesKHR it advertises
 //   3. for each subgroup-scope configuration with a matching prebuilt kernel
-//      (assets/shaders/gemm_<A>_<B>_<C>[_sat]_<v4|v1>.spv):
+//      (assets/shaders/gemm_<A>_<B>_<C>[_sat]_<v4|v1>[_direct].spv), and for
+//      each memory path (no LDS / LDS single / double / triple buffered):
 //        - short tuning sweep over workgroup/warp tiling at 2048^3
 //        - final timed run of the best tiling (GPU timestamps)
 //        - spot-check 64 output elements against a CPU reference
@@ -359,13 +360,14 @@ std::string tileDesc(const Tile &t, uint32_t lM, uint32_t lN, uint32_t sg) {
 }
 
 VkPipeline makePipeline(Gpu &g, VkShaderModule mod, uint32_t lM, uint32_t lN, uint32_t lK,
-                        const Tile &t, VkResult &err) {
+                        const Tile &t, uint32_t stages, VkResult &err) {
     uint32_t local = t.wgW * t.wgH * g.sgSize;
-    uint32_t spec[12] = { lM, lN, lK, kSize, kSize, kSize,
-                          t.cRows, t.cCols, t.wgW, t.wgH, t.bk, local };
-    VkSpecializationMapEntry ent[12];
-    for (uint32_t i = 0; i < 12; ++i) ent[i] = { i, i * 4, 4 };
-    VkSpecializationInfo si{ 12, ent, sizeof spec, spec };
+    uint32_t spec[14] = { lM, lN, lK, kSize, kSize, kSize,
+                          t.cRows, t.cCols, t.wgW, t.wgH, t.bk, local,
+                          std::max(stages, 1u), local };
+    VkSpecializationMapEntry ent[14];
+    for (uint32_t i = 0; i < 14; ++i) ent[i] = { i, i * 4, 4 };
+    VkSpecializationInfo si{ 14, ent, sizeof spec, spec };
 
     VkPipelineShaderStageRequiredSubgroupSizeCreateInfo rss{
         VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO };
@@ -481,8 +483,22 @@ std::vector<uint8_t> loadAsset(AAssetManager *am, const std::string &path) {
 // ---------------------------------------------------------------------------
 struct TuneResult { Tile t; double tops; std::string note; };
 
-struct Entry {
-    VkCooperativeMatrixPropertiesKHR cfg;
+// Memory path of the kernel. Every configuration is measured with each one.
+struct Variant {
+    const char *id;
+    const char *label;
+    bool direct;        // no shared memory
+    uint32_t stages;    // LDS buffers (spec constant 12)
+};
+const Variant kVariants[] = {
+    { "direct", "no LDS",          true,  0 },
+    { "lds1",   "LDS x1",          false, 1 },
+    { "lds2",   "LDS x2 (double)", false, 2 },
+    { "lds3",   "LDS x3 (triple)", false, 3 },
+};
+
+struct Result {
+    std::string id, label;
     std::string status = "skip";   // ok | skip | fail
     std::string reason;
     std::string kernel;
@@ -491,6 +507,11 @@ struct Entry {
     std::string check;
     double maxErr = NAN;
     std::vector<TuneResult> tune;
+};
+
+struct Entry : Result {           // top-level fields = fastest passing variant
+    VkCooperativeMatrixPropertiesKHR cfg;
+    std::vector<Result> vars;
 };
 
 // Reasons this configuration cannot be benchmarked by our kernel/features.
@@ -521,10 +542,23 @@ std::string unsupportedReason(const Gpu &g, const VkCooperativeMatrixPropertiesK
     return "";
 }
 
+VkShaderModule loadModule(Gpu &g, AAssetManager *am, const std::string &file, std::string &err) {
+    std::vector<uint8_t> spv = loadAsset(am, "shaders/" + file);
+    if (spv.empty()) { err = "no prebuilt kernel (" + file + ")"; return VK_NULL_HANDLE; }
+    VkShaderModuleCreateInfo smci{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
+    smci.codeSize = spv.size();
+    smci.pCode = (const uint32_t *)spv.data();
+    VkShaderModule mod = VK_NULL_HANDLE;
+    VkResult r = vkCreateShaderModule(g.dev, &smci, nullptr, &mod);
+    if (r != VK_SUCCESS) { err = "vkCreateShaderModule=" + std::to_string(r); return VK_NULL_HANDLE; }
+    return mod;
+}
+
 void benchEntry(Gpu &g, AAssetManager *am, Log &log, Entry &e) {
     const auto &c = e.cfg;
     const TypeInfo &A = *typeInfo(c.AType), &B = *typeInfo(c.BType), &C = *typeInfo(c.CType);
     const uint32_t lM = c.MSize, lN = c.NSize, lK = c.KSize;
+    const bool intOut = C.kind != Kind::Float;
 
     // Pick the widest staging unit the fragment offsets stay aligned to.
     uint32_t ld = 0;
@@ -532,26 +566,15 @@ void benchEntry(Gpu &g, AAssetManager *am, Log &log, Entry &e) {
         if ((lK * A.bytes) % cand == 0 && (lN * B.bytes) % cand == 0) { ld = cand; break; }
     if (!ld) { e.reason = "fragment row not 4-byte aligned"; return; }
 
-    std::string base = std::string("gemm_") + A.key + "_" + B.key + "_" + C.key + (c.saturatingAccumulation ? "_sat" : "");
-    std::string file = base + (ld == 16 ? "_v4" : "_v1") + ".spv";
-    std::vector<uint8_t> spv = loadAsset(am, "shaders/" + file);
-    if (spv.empty()) { e.reason = "no prebuilt kernel (" + file + ")"; return; }
-    e.kernel = file;
+    const std::string base = std::string("gemm_") + A.key + "_" + B.key + "_" + C.key +
+                             (c.saturatingAccumulation ? "_sat" : "") + (ld == 16 ? "_v4" : "_v1");
 
-    VkShaderModuleCreateInfo smci{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
-    smci.codeSize = spv.size();
-    smci.pCode = (const uint32_t *)spv.data();
-    VkShaderModule mod;
-    VkResult r = vkCreateShaderModule(g.dev, &smci, nullptr, &mod);
-    if (r != VK_SUCCESS) { e.status = "fail"; e.reason = "vkCreateShaderModule=" + std::to_string(r); return; }
-
-    // Buffers + data.
+    // Buffers + data (shared by all variants).
     const size_t elems = (size_t)kSize * kSize;
     Buf bA, bB, bD;
     if (!makeBuf(g, elems * A.bytes, bA) || !makeBuf(g, elems * B.bytes, bB) || !makeBuf(g, elems * C.bytes, bD)) {
         e.status = "fail"; e.reason = "buffer allocation failed";
         freeBuf(g, bA); freeBuf(g, bB); freeBuf(g, bD);
-        vkDestroyShaderModule(g.dev, mod, nullptr);
         return;
     }
     std::vector<int8_t> hA(elems), hB(elems);
@@ -575,7 +598,23 @@ void benchEntry(Gpu &g, AAssetManager *am, Log &log, Entry &e) {
     };
     fill(A, hA, bA, 0x1234u);
     fill(B, hB, bB, 0xBEEFu);
-    memset(bD.p, 0, bD.size);
+
+    // CPU reference for the 64 spot-check positions (corners + random), once.
+    struct Probe { uint32_t row, col; int64_t ref; };
+    std::vector<Probe> probes;
+    {
+        Lcg rng(0xC0FFEEu);
+        for (int s = 0; s < 64; ++s) {
+            uint32_t row, col;
+            if (s == 0) { row = 0; col = 0; }
+            else if (s == 1) { row = kSize - 1; col = kSize - 1; }
+            else { row = rng.next() % kSize; col = rng.next() % kSize; }
+            int64_t ref = 0;
+            for (uint32_t k = 0; k < kSize; ++k)
+                ref += (int64_t)hA[(size_t)row * kSize + k] * hB[(size_t)k * kSize + col];
+            probes.push_back({ row, col, ref });
+        }
+    }
 
     VkDescriptorBufferInfo dbi[3] = { { bA.b, 0, VK_WHOLE_SIZE }, { bB.b, 0, VK_WHOLE_SIZE }, { bD.b, 0, VK_WHOLE_SIZE } };
     VkWriteDescriptorSet w[3];
@@ -601,84 +640,124 @@ void benchEntry(Gpu &g, AAssetManager *am, Log &log, Entry &e) {
         for (uint32_t bk : { bk0, bk0 * 2 }) cands.push_back({ s[0], s[1], s[2], s[3], bk });
 
     const auto &L = g.props.limits;
-    Tile best{};
-    double bestTops = -1;
-    for (const Tile &t : cands) {
-        if (g.lost) break;
-        TuneResult tr{ t, NAN, "" };
-        uint32_t TM = t.tileM(lM), TN = t.tileN(lN), thr = t.wgW * t.wgH * g.sgSize;
-        uint32_t lds = (TM * (t.bk * A.bytes / ld + 1) + t.bk * (TN * B.bytes / ld + 1)) * ld;
-        if (kSize % TM || kSize % TN || kSize % t.bk || (t.bk * A.bytes) % ld) tr.note = "tile does not divide 2048";
-        else if (lds > L.maxComputeSharedMemorySize) tr.note = "LDS " + std::to_string(lds) + " B > limit";
-        else if (thr > L.maxComputeWorkGroupInvocations || thr > L.maxComputeWorkGroupSize[0]) tr.note = "too many invocations";
-        if (tr.note.empty()) {
-            VkResult pr;
-            VkPipeline p = makePipeline(g, mod, lM, lN, lK, t, pr);
-            if (!p) tr.note = "pipeline creation failed (" + std::to_string(pr) + ")";
-            else {
-                std::vector<double> ms;
-                std::string err;
-                if (runTimed(g, p, kSize / TN, kSize / TM, 1, 3, ms, err)) {
-                    tr.tops = tops(median(ms));
-                    if (tr.tops > bestTops) { bestTops = tr.tops; best = t; }
-                } else tr.note = err;
-                vkDestroyPipeline(g.dev, p, nullptr);
-            }
-        }
-        e.tune.push_back(tr);
-    }
+    VkShaderModule mods[2] = { VK_NULL_HANDLE, VK_NULL_HANDLE };   // [0] LDS, [1] direct
+    std::string modErr[2];
 
-    if (bestTops <= 0) {
-        e.status = "fail";
-        e.reason = "no tiling ran";
-        for (const auto &tr : e.tune) if (!tr.note.empty()) { e.reason += ": " + tr.note; break; }
-    } else {
+    auto done = [&](Result &res) {
+        if (res.status == "ok")
+            log.line("      %-16s %8.3f %s  (median %.3f ms, best %.3f ms)  [%s]", res.label.c_str(), res.value,
+                     intOut ? "TOPS" : "TFLOPS", res.ms, res.msBest, res.tileText.c_str());
+        else
+            log.line("      %-16s %s: %s%s%s", res.label.c_str(), res.status.c_str(), res.reason.c_str(),
+                     res.check.empty() ? "" : "  ", res.check.c_str());
+        e.vars.push_back(res);
+    };
+
+    for (const Variant &v : kVariants) {
+        Result res;
+        res.id = v.id;
+        res.label = v.label;
+        res.kernel = base + (v.direct ? "_direct" : "") + ".spv";
+        const int mi = v.direct ? 1 : 0;
+        if (g.lost) { res.reason = "device lost earlier"; done(res); continue; }
+        if (!mods[mi] && modErr[mi].empty()) mods[mi] = loadModule(g, am, res.kernel, modErr[mi]);
+        if (!mods[mi]) {
+            res.status = modErr[mi].rfind("no prebuilt", 0) == 0 ? "skip" : "fail";
+            res.reason = modErr[mi];
+            done(res);
+            continue;
+        }
+
+        // --- tune ---
+        Tile best{};
+        double bestTops = -1;
+        for (const Tile &t : cands) {
+            if (g.lost) break;
+            TuneResult tr{ t, NAN, "" };
+            uint32_t TM = t.tileM(lM), TN = t.tileN(lN), thr = t.wgW * t.wgH * g.sgSize;
+            uint32_t lds = v.direct ? 0
+                : v.stages * (TM * (t.bk * A.bytes / ld + 1) + t.bk * (TN * B.bytes / ld + 1)) * ld;
+            if (kSize % TM || kSize % TN || kSize % t.bk || (t.bk * A.bytes) % ld) tr.note = "tile does not divide 2048";
+            else if (lds > L.maxComputeSharedMemorySize) tr.note = "LDS " + std::to_string(lds) + " B > limit";
+            else if (thr > L.maxComputeWorkGroupInvocations || thr > L.maxComputeWorkGroupSize[0]) tr.note = "too many invocations";
+            if (tr.note.empty()) {
+                VkResult pr;
+                VkPipeline p = makePipeline(g, mods[mi], lM, lN, lK, t, v.stages, pr);
+                if (!p) tr.note = "pipeline creation failed (" + std::to_string(pr) + ")";
+                else {
+                    std::vector<double> ms;
+                    std::string err;
+                    if (runTimed(g, p, kSize / TN, kSize / TM, 1, 3, ms, err)) {
+                        tr.tops = tops(median(ms));
+                        if (tr.tops > bestTops) { bestTops = tr.tops; best = t; }
+                    } else tr.note = err;
+                    vkDestroyPipeline(g.dev, p, nullptr);
+                }
+            }
+            res.tune.push_back(tr);
+        }
+
+        if (bestTops <= 0) {
+            res.status = "fail";
+            res.reason = "no tiling ran";
+            for (const auto &tr : res.tune) if (!tr.note.empty()) { res.reason += ": " + tr.note; break; }
+            done(res);
+            continue;
+        }
+
+        // --- final timed run + check (D cleared so a variant can't pass on a previous one's output) ---
+        memset(bD.p, 0, bD.size);
         VkResult pr;
-        VkPipeline p = makePipeline(g, mod, lM, lN, lK, best, pr);
+        VkPipeline p = makePipeline(g, mods[mi], lM, lN, lK, best, v.stages, pr);
         std::vector<double> ms;
         std::string err;
         uint32_t TM = best.tileM(lM), TN = best.tileN(lN);
         if (p && runTimed(g, p, kSize / TN, kSize / TM, 2, 10, ms, err)) {
-            e.ms = median(ms);
-            e.msBest = *std::min_element(ms.begin(), ms.end());
-            e.value = tops(e.ms);
-            e.valueBest = tops(e.msBest);
-            e.tileText = tileDesc(best, lM, lN, g.sgSize);
+            res.ms = median(ms);
+            res.msBest = *std::min_element(ms.begin(), ms.end());
+            res.value = tops(res.ms);
+            res.valueBest = tops(res.msBest);
+            res.tileText = tileDesc(best, lM, lN, g.sgSize);
 
-            // Spot-check 64 outputs (corners + random).
-            Lcg rng(0xC0FFEEu);
             int bad = 0;
             double maxErr = 0;
-            bool intOut = C.kind != Kind::Float;
-            for (int s = 0; s < 64; ++s) {
-                uint32_t row, col;
-                if (s == 0) { row = 0; col = 0; }
-                else if (s == 1) { row = kSize - 1; col = kSize - 1; }
-                else { row = rng.next() % kSize; col = rng.next() % kSize; }
-                int64_t ref = 0;
-                for (uint32_t k = 0; k < kSize; ++k)
-                    ref += (int64_t)hA[(size_t)row * kSize + k] * hB[(size_t)k * kSize + col];
-                double got = decodeOut(C.t, bD.p, (size_t)row * kSize + col);
-                double errv = std::fabs(got - (double)ref);
+            for (const Probe &pb : probes) {
+                double got = decodeOut(C.t, bD.p, (size_t)pb.row * kSize + pb.col);
+                double errv = std::fabs(got - (double)pb.ref);
                 double tol = intOut || C.t == VK_COMPONENT_TYPE_FLOAT32_KHR ? 0.0
                            : C.t == VK_COMPONENT_TYPE_FLOAT16_KHR ? 1.0
-                           : std::max(2.0, 0.02 * std::fabs((double)ref));   // bf16 accumulator
+                           : std::max(2.0, 0.02 * std::fabs((double)pb.ref));   // bf16 accumulator
                 if (!(errv <= tol)) ++bad;
                 if (std::isfinite(errv)) maxErr = std::max(maxErr, errv); else maxErr = INFINITY;
             }
-            e.maxErr = maxErr;
-            e.check = bad ? "FAIL " + std::to_string(bad) + "/64" : "pass 64/64";
-            e.status = bad ? "fail" : "ok";
-            if (bad) e.reason = "wrong results";
+            res.maxErr = maxErr;
+            res.check = bad ? "FAIL " + std::to_string(bad) + "/64" : "pass 64/64";
+            res.status = bad ? "fail" : "ok";
+            if (bad) res.reason = "wrong results";
         } else {
-            e.status = "fail";
-            e.reason = p ? err : "pipeline creation failed (" + std::to_string(pr) + ")";
+            res.status = "fail";
+            res.reason = p ? err : "pipeline creation failed (" + std::to_string(pr) + ")";
         }
         if (p) vkDestroyPipeline(g.dev, p, nullptr);
+
+        done(res);
     }
 
+    // Headline = fastest passing variant; otherwise the first failure (or skip).
+    const Result *top = nullptr;
+    for (const auto &r : e.vars)
+        if (r.status == "ok" && (!top || r.value > top->value)) top = &r;
+    if (!top) for (const auto &r : e.vars) if (r.status == "fail") { top = &r; break; }
+    if (!top && !e.vars.empty()) top = &e.vars.front();
+    if (top) {
+        std::vector<Result> keep;
+        keep.swap(e.vars);
+        static_cast<Result &>(e) = *top;
+        e.vars.swap(keep);
+    }
+
+    for (VkShaderModule m : mods) if (m) vkDestroyShaderModule(g.dev, m, nullptr);
     freeBuf(g, bA); freeBuf(g, bB); freeBuf(g, bD);
-    vkDestroyShaderModule(g.dev, mod, nullptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -994,9 +1073,9 @@ std::string run(AAssetManager *am, Log &log) {
             if (e.reason.empty()) benchEntry(g, am, log, e);
         }
         if (e.status == "ok")
-            log.line("      %.3f %s (median %.3f ms, best %.3f ms)  check %s  [%s]",
-                     e.value, isInt ? "TOPS" : "TFLOPS", e.ms, e.msBest, e.check.c_str(), e.tileText.c_str());
-        else
+            log.line("      => best: %s  %.3f %s  check %s", e.label.c_str(), e.value, isInt ? "TOPS" : "TFLOPS",
+                     e.check.c_str());
+        else if (e.vars.empty())
             log.line("      %s: %s%s%s", e.status.c_str(), e.reason.c_str(),
                      e.check.empty() ? "" : "  ", e.check.c_str());
     }
@@ -1012,10 +1091,20 @@ std::string run(AAssetManager *am, Log &log) {
             .kv("unit", isInt ? "TOPS" : "TFLOPS")
             .kv("value", e.value).kv("valueBest", e.valueBest)
             .kv("ms", e.ms).kv("msBest", e.msBest)
-            .kv("check", e.check).kv("maxErr", e.maxErr).kv("tile", e.tileText);
-        j.arr("tune");
-        for (const auto &t : e.tune)
-            j.obj().kv("tile", tileDesc(t.t, c.MSize, c.NSize, g.sgSize)).kv("value", t.tops).kv("note", t.note).endObj();
+            .kv("check", e.check).kv("maxErr", e.maxErr).kv("tile", e.tileText)
+            .kv("best", e.id).kv("bestLabel", e.label);
+        j.arr("variants");
+        for (const auto &v : e.vars) {
+            j.obj().kv("id", v.id).kv("label", v.label)
+                .kv("status", v.status).kv("reason", v.reason).kv("kernel", v.kernel)
+                .kv("value", v.value).kv("valueBest", v.valueBest)
+                .kv("ms", v.ms).kv("msBest", v.msBest)
+                .kv("check", v.check).kv("maxErr", v.maxErr).kv("tile", v.tileText);
+            j.arr("tune");
+            for (const auto &t : v.tune)
+                j.obj().kv("tile", tileDesc(t.t, c.MSize, c.NSize, g.sgSize)).kv("value", t.tops).kv("note", t.note).endObj();
+            j.endArr().endObj();
+        }
         j.endArr().endObj();
     }
     j.endArr();

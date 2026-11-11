@@ -3,8 +3,8 @@
  * (all row-major, alpha = 1, beta = 0, no C input).
  *
  * Structure follows VK_Test/shaders/gemm_v07.comp (block tile -> warp tile ->
- * coopmat fragment, K marched in BK slabs staged through shared memory), with
- * one change that makes it work for every element type:
+ * coopmat fragment, K marched in BK slabs), with one change that makes it work
+ * for every element type:
  *
  *   A and B are never touched as their element type. Global buffers and the
  *   shared-memory tiles are declared as LD_T (uvec4 or uint) and copied as raw
@@ -15,11 +15,29 @@
  * Offsets and strides passed to coopMatLoad are in LD_T units, so the host only
  * picks this variant when lK*A_BYTES and lN*B_BYTES are multiples of LD_BYTES.
  *
+ * Two memory paths (compile-time DIRECT):
+ *
+ *   DIRECT = 1  no shared memory. Every subgroup coopMatLoads its A/B fragments
+ *               straight from the global buffers (reuse across subgroups is left
+ *               to the cache).
+ *   DIRECT = 0  A/B slabs staged through shared memory, STAGES (spec constant)
+ *               buffers deep:
+ *       1  single buffer: barrier, copy global->LDS, barrier, compute.
+ *       2  double buffer: the next slab is loaded global->registers before the
+ *          current slab's MMAs, written to the other LDS buffer after them;
+ *          one barrier per slab.
+ *       3  triple buffer: slab t+1 (already in registers) is written to LDS at
+ *          the top of iteration t, then slab t+2 is fetched into registers, then
+ *          slab t is computed. The global load has a full compute phase to land
+ *          and the LDS write is a full iteration ahead of its reader; one
+ *          barrier per slab.
+ *
  * Compile-time defines (see build_shaders.sh):
  *   A_T, B_T, C_T          GLSL component types of the A, B and accumulator/result
  *   A_BYTES, B_BYTES       sizeof(A_T), sizeof(B_T)
  *   LD_T, LD_BYTES         uvec4/16 or uint/4
  *   SAT                    1 -> saturating accumulation
+ *   DIRECT                 1 -> no shared memory (see above)
  *   NEED_BF16, NEED_FP8    enable the extension that declares the type
  */
 #version 450 core
@@ -47,18 +65,16 @@ layout(constant_id = 6)  const uint C_ROWS = 4;  // fragments per subgroup along
 layout(constant_id = 7)  const uint C_COLS = 2;  // fragments per subgroup along N
 layout(constant_id = 8)  const uint WG_W = 4;    // subgroups per workgroup along N
 layout(constant_id = 9)  const uint WG_H = 2;    // subgroups per workgroup along M
-layout(constant_id = 10) const uint BK = 32;     // K slab staged per iteration (multiple of lK)
+layout(constant_id = 10) const uint BK = 32;     // K slab per iteration (multiple of lK)
 layout(local_size_x_id = 11, local_size_y = 1, local_size_z = 1) in;
+layout(constant_id = 12) const uint STAGES = 1;  // LDS buffers (1..3), ignored when DIRECT
+layout(constant_id = 13) const uint NTHR = 256;  // == local_size_x
 
 const uint TILE_M = WG_H * C_ROWS * lM;
 const uint TILE_N = WG_W * C_COLS * lN;
 
 const uint EPU_A = LD_BYTES / A_BYTES;   // A elements per load unit
 const uint EPU_B = LD_BYTES / B_BYTES;
-const uint A_ROW = BK / EPU_A;           // load units in one staged A row
-const uint B_ROW = TILE_N / EPU_B;       // load units in one staged B row
-const uint SA    = A_ROW + 1;            // +1 unit of padding against bank conflicts
-const uint SB    = B_ROW + 1;
 const uint A_GROW = K / EPU_A;           // load units in one global A row
 const uint B_GROW = N / EPU_B;
 
@@ -66,8 +82,21 @@ layout(set = 0, binding = 0) readonly  buffer BufA { LD_T a[]; };
 layout(set = 0, binding = 1) readonly  buffer BufB { LD_T b[]; };
 layout(set = 0, binding = 2) writeonly buffer BufD { C_T  d[]; };
 
-shared LD_T As[TILE_M * SA];
-shared LD_T Bs[BK * SB];
+#if !DIRECT
+const uint A_ROW = BK / EPU_A;           // load units in one staged A row
+const uint B_ROW = TILE_N / EPU_B;       // load units in one staged B row
+const uint SA    = A_ROW + 1;            // +1 unit of padding against bank conflicts
+const uint SB    = B_ROW + 1;
+const uint A_TILE = TILE_M * SA;         // units per stage
+const uint B_TILE = BK * SB;
+const uint A_TOTAL = TILE_M * A_ROW;     // units copied per slab
+const uint B_TOTAL = BK * B_ROW;
+const uint A_PER = (A_TOTAL + NTHR - 1) / NTHR;   // units per invocation per slab
+const uint B_PER = (B_TOTAL + NTHR - 1) / NTHR;
+
+shared LD_T As[STAGES * A_TILE];
+shared LD_T Bs[STAGES * B_TILE];
+#endif
 
 #if SAT
 #define MMA(x, y, z) coopMatMulAdd(x, y, z, gl_MatrixOperandsSaturatingAccumulation)
@@ -75,50 +104,136 @@ shared LD_T Bs[BK * SB];
 #define MMA(x, y, z) coopMatMulAdd(x, y, z)
 #endif
 
+#define FRAG_A coopmat<A_T, gl_ScopeSubgroup, lM, lK, gl_MatrixUseA>
+#define FRAG_B coopmat<B_T, gl_ScopeSubgroup, lK, lN, gl_MatrixUseB>
+#define FRAG_C coopmat<C_T, gl_ScopeSubgroup, lM, lN, gl_MatrixUseAccumulator>
+
 void main()
 {
     const uint tid  = gl_LocalInvocationID.x;
-    const uint nth  = gl_WorkGroupSize.x;
     const uint sgid = gl_SubgroupID;
     const uvec2 warp = uvec2(sgid % WG_W, sgid / WG_W);
 
     const uint rowBase = TILE_M * gl_WorkGroupID.y;
     const uint colBase = TILE_N * gl_WorkGroupID.x;
 
-    coopmat<C_T, gl_ScopeSubgroup, lM, lN, gl_MatrixUseAccumulator> acc[C_ROWS][C_COLS];
+    FRAG_C acc[C_ROWS][C_COLS];
     [[unroll]] for (uint i = 0; i < C_ROWS; ++i)
         [[unroll]] for (uint j = 0; j < C_COLS; ++j)
-            acc[i][j] = coopmat<C_T, gl_ScopeSubgroup, lM, lN, gl_MatrixUseAccumulator>(0);
+            acc[i][j] = FRAG_C(0);
 
+#if DIRECT
+    // ---------------------------------------------------------------- no LDS
+    const uint aRow0 = rowBase + lM * C_ROWS * warp.y;
+    const uint bCol0 = colBase + lN * C_COLS * warp.x;
     for (uint k0 = 0; k0 < K; k0 += BK) {
-        barrier();
-        for (uint idx = tid; idx < TILE_M * A_ROW; idx += nth) {
-            uint r = idx / A_ROW, c = idx % A_ROW;
-            As[r * SA + c] = a[(rowBase + r) * A_GROW + k0 / EPU_A + c];
-        }
-        for (uint idx = tid; idx < BK * B_ROW; idx += nth) {
-            uint r = idx / B_ROW, c = idx % B_ROW;
-            Bs[r * SB + c] = b[(k0 + r) * B_GROW + colBase / EPU_B + c];
-        }
-        barrier();
-
         [[unroll]] for (uint kk = 0; kk < BK; kk += lK) {
-            coopmat<A_T, gl_ScopeSubgroup, lM, lK, gl_MatrixUseA> matA[C_ROWS];
-            [[unroll]] for (uint i = 0; i < C_ROWS; ++i) {
-                uint sRow = lM * (C_ROWS * warp.y + i);
-                coopMatLoad(matA[i], As, sRow * SA + kk / EPU_A, SA,
+            FRAG_A matA[C_ROWS];
+            [[unroll]] for (uint i = 0; i < C_ROWS; ++i)
+                coopMatLoad(matA[i], a, (aRow0 + lM * i) * A_GROW + (k0 + kk) / EPU_A, A_GROW,
                             gl_CooperativeMatrixLayoutRowMajor);
-            }
             [[unroll]] for (uint j = 0; j < C_COLS; ++j) {
-                coopmat<B_T, gl_ScopeSubgroup, lK, lN, gl_MatrixUseB> matB;
-                uint sCol = lN * (C_COLS * warp.x + j);
-                coopMatLoad(matB, Bs, kk * SB + sCol / EPU_B, SB,
+                FRAG_B matB;
+                coopMatLoad(matB, b, (k0 + kk) * B_GROW + (bCol0 + lN * j) / EPU_B, B_GROW,
                             gl_CooperativeMatrixLayoutRowMajor);
                 [[unroll]] for (uint i = 0; i < C_ROWS; ++i)
                     acc[i][j] = MMA(matA[i], matB, acc[i][j]);
             }
         }
     }
+#else
+    // ------------------------------------------------------------ LDS staged
+    LD_T ra[A_PER];
+    LD_T rb[B_PER];
+
+    // global slab starting at k0 -> registers
+#define GLOAD(k0) {                                                            \
+        [[unroll]] for (uint i = 0; i < A_PER; ++i) {                          \
+            uint idx = tid + i * NTHR;                                         \
+            if (A_TOTAL % NTHR == 0 || idx < A_TOTAL) {                        \
+                uint r = idx / A_ROW, c = idx % A_ROW;                         \
+                ra[i] = a[(rowBase + r) * A_GROW + (k0) / EPU_A + c];          \
+            }                                                                  \
+        }                                                                      \
+        [[unroll]] for (uint i = 0; i < B_PER; ++i) {                          \
+            uint idx = tid + i * NTHR;                                         \
+            if (B_TOTAL % NTHR == 0 || idx < B_TOTAL) {                        \
+                uint r = idx / B_ROW, c = idx % B_ROW;                         \
+                rb[i] = b[((k0) + r) * B_GROW + colBase / EPU_B + c];          \
+            }                                                                  \
+        }                                                                      \
+    }
+    // registers -> LDS stage s
+#define SSTORE(s) {                                                            \
+        [[unroll]] for (uint i = 0; i < A_PER; ++i) {                          \
+            uint idx = tid + i * NTHR;                                         \
+            if (A_TOTAL % NTHR == 0 || idx < A_TOTAL)                          \
+                As[(s) * A_TILE + (idx / A_ROW) * SA + idx % A_ROW] = ra[i];   \
+        }                                                                      \
+        [[unroll]] for (uint i = 0; i < B_PER; ++i) {                          \
+            uint idx = tid + i * NTHR;                                         \
+            if (B_TOTAL % NTHR == 0 || idx < B_TOTAL)                          \
+                Bs[(s) * B_TILE + (idx / B_ROW) * SB + idx % B_ROW] = rb[i];   \
+        }                                                                      \
+    }
+    // MMAs over LDS stage s
+#define COMPUTE(s) {                                                           \
+        [[unroll]] for (uint kk = 0; kk < BK; kk += lK) {                      \
+            FRAG_A matA[C_ROWS];                                               \
+            [[unroll]] for (uint i = 0; i < C_ROWS; ++i) {                     \
+                uint sRow = lM * (C_ROWS * warp.y + i);                        \
+                coopMatLoad(matA[i], As, (s) * A_TILE + sRow * SA + kk / EPU_A,\
+                            SA, gl_CooperativeMatrixLayoutRowMajor);           \
+            }                                                                  \
+            [[unroll]] for (uint j = 0; j < C_COLS; ++j) {                     \
+                FRAG_B matB;                                                   \
+                uint sCol = lN * (C_COLS * warp.x + j);                        \
+                coopMatLoad(matB, Bs, (s) * B_TILE + kk * SB + sCol / EPU_B,   \
+                            SB, gl_CooperativeMatrixLayoutRowMajor);           \
+                [[unroll]] for (uint i = 0; i < C_ROWS; ++i)                   \
+                    acc[i][j] = MMA(matA[i], matB, acc[i][j]);                 \
+            }                                                                  \
+        }                                                                      \
+    }
+
+    const uint T = K / BK;
+    if (STAGES <= 1) {
+        for (uint t = 0; t < T; ++t) {
+            barrier();
+            GLOAD(t * BK);
+            SSTORE(0);
+            barrier();
+            COMPUTE(0);
+        }
+    } else if (STAGES == 2) {
+        GLOAD(0);
+        SSTORE(0);
+        barrier();
+        uint cur = 0;
+        for (uint t = 0; t < T; ++t) {
+            const bool more = t + 1 < T;
+            if (more) GLOAD((t + 1) * BK);     // in flight during the MMAs below
+            COMPUTE(cur);
+            if (more) SSTORE(cur ^ 1u);        // last read in iteration t-1 (fenced)
+            barrier();
+            cur ^= 1u;
+        }
+    } else {
+        GLOAD(0);
+        SSTORE(0);
+        if (T > 1) GLOAD(BK);                  // registers hold slab 1
+        barrier();
+        uint cur = 0, nxt = 1;
+        for (uint t = 0; t < T; ++t) {
+            if (t + 1 < T) SSTORE(nxt);        // slab t+1; that buffer last read in t-2
+            if (t + 2 < T) GLOAD((t + 2) * BK);
+            COMPUTE(cur);
+            barrier();
+            cur = cur == 2u ? 0u : cur + 1u;
+            nxt = nxt == 2u ? 0u : nxt + 1u;
+        }
+    }
+#endif
 
     [[unroll]] for (uint i = 0; i < C_ROWS; ++i) {
         uint gi = rowBase + lM * (C_ROWS * warp.y + i);
